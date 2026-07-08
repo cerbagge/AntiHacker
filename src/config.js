@@ -19,8 +19,6 @@ module.exports = Object.freeze({
   SCAM_IMAGE_GUARD_ENABLED: process.env.SCAM_IMAGE_GUARD_ENABLED === 'true',
   // 자동삭제 임계값(점수). 이 이상 + 서로 다른 신호 2종류 이상이면 삭제
   SCAM_AUTODELETE_THRESHOLD: parseInt(process.env.SCAM_AUTODELETE_THRESHOLD, 10) || 70,
-  // 삭제 로그를 보낼 채널 ID(선택). 비워두면 관리자 DM으로만 통지
-  SCAM_LOG_CHANNEL_ID: process.env.SCAM_LOG_CHANNEL_ID || '',
   // 로컬 VLM(Ollama) 사용 여부. 'false'로 명시하면 끔 (기본 켬, Ollama 없으면 자동 스킵)
   SCAM_VLM_ENABLED: process.env.SCAM_VLM_ENABLED !== 'false',
   // 로컬 VLM(Ollama) 설정

@@ -110,14 +110,6 @@ async function handleScamDelete(message, scanResult) {
   const makeFiles = () =>
     trigger.buffer ? [new AttachmentBuilder(trigger.buffer, { name: `scam_${trigger.attachmentName || 'image'}` })] : [];
 
-  if (config.SCAM_LOG_CHANNEL_ID) {
-    try {
-      const ch = await message.client.channels.fetch(config.SCAM_LOG_CHANNEL_ID);
-      if (ch && ch.isTextBased()) await ch.send({ embeds: [embed], files: makeFiles() });
-    } catch (e) {
-      logger.warn('스캠 로그 채널 전송 실패', { error: e.message, channel: config.SCAM_LOG_CHANNEL_ID });
-    }
-  }
   await guildLogger.logToGuild(message.client, message.guild?.id, { embeds: [embed], files: makeFiles() });
 
   return alert.id;
@@ -169,14 +161,6 @@ async function handleVirusDelete(message, attachment, scan) {
   await addNoPermNotice(embed, deleted, lang);
   await addSanctionField(embed, message, lang);
 
-  if (config.SCAM_LOG_CHANNEL_ID) {
-    try {
-      const ch = await message.client.channels.fetch(config.SCAM_LOG_CHANNEL_ID);
-      if (ch && ch.isTextBased()) await ch.send({ embeds: [embed] });
-    } catch (e) {
-      logger.warn('바이러스 로그 채널 전송 실패', { error: e.message });
-    }
-  }
   await guildLogger.logToGuild(message.client, message.guild?.id, { embeds: [embed] });
 
   return alert.id;
@@ -313,14 +297,6 @@ async function handleNsfwInviteDelete(message, verdict) {
   await addNoPermNotice(embed, deleted, lang);
   await addSanctionField(embed, message, lang);
 
-  if (config.SCAM_LOG_CHANNEL_ID) {
-    try {
-      const ch = await message.client.channels.fetch(config.SCAM_LOG_CHANNEL_ID);
-      if (ch && ch.isTextBased()) await ch.send({ embeds: [embed] });
-    } catch (e) {
-      logger.warn('NSFW 초대 로그 채널 전송 실패', { error: e.message });
-    }
-  }
   await guildLogger.logToGuild(message.client, message.guild?.id, { embeds: [embed] });
 
   return alert.id;
