@@ -70,7 +70,7 @@ cp .env.example .env
 | 변수 | 기본값 | 설명 |
 |------|--------|------|
 | `DISCORD_BOT_TOKEN` | — | (필수) 디스코드 봇 토큰 |
-| `SCAM_IMAGE_GUARD_ENABLED` | `false` | 로컬 스캠 이미지 감지 전체 스위치 (RAM 업그레이드 후 `true` 권장) |
+| `SCAM_IMAGE_GUARD_ENABLED` | `false` | 로컬 스캠 이미지 감지 전체 스위치 (`true` 권장) |
 | `SCAM_AUTODELETE_THRESHOLD` | `70` | 자동삭제 점수 임계값 |
 | `SCAM_VLM_ENABLED` | `true` | 로컬 VLM(Ollama) 사용 여부 (없으면 자동 스킵) |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama 주소 |
