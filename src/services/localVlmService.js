@@ -146,64 +146,6 @@ async function analyzeDiscordServer({ name, description, iconBuffer } = {}) {
   }
 }
 
-// ── 디스코드 링크 동반 메시지(문구) 분석용 프롬프트 ──
-// 링크 자체가 아니라 함께 적힌 메시지 문구가 스팸/성인 유인인지 판정.
-// 정상적인 통화방/서버 초대·공유는 통과시키는 것이 목적.
-const LINK_MESSAGE_PROMPT = [
-  'You are a strict Discord chat-message moderation classifier.',
-  'You are given ONE chat message that contains a Discord invite or channel link',
-  '(the link itself is replaced with a placeholder like [discord-invite]).',
-  'Decide two flags about the MESSAGE TEXT, not the link:',
-  '- adult: the text lures readers to sexual/adult content — adult voice-chat room invites with sexual framing',
-  '  (e.g. "성인 통화방", "섹트", age/gender bait like "20살 여자"), nudes/cam/hookup offers, porn sharing.',
-  '- spam: the text is unsolicited mass-advertising or a scam lure — fake Nitro/giveaway, crypto/airdrop scam,',
-  '  account/cheat/selfbot selling, raid-or-nuke service, "join for free rewards" bait, copy-paste ad blasts.',
-  'A normal message is NEITHER (both false): friends inviting each other to a voice call or server,',
-  'sharing a community/game/study server with ordinary context, or casual chat that happens to include a link.',
-  'Judge ONLY from the given text; do not assume.',
-  'Respond with ONLY this JSON, nothing else:',
-  '{"adult": true|false, "spam": true|false, "confidence": 0.0-1.0, "reason": "<short reason>"}',
-].join(' ');
-
-/**
- * 디스코드 링크가 포함된 메시지의 문구를 로컬 VLM으로 분석 (텍스트 전용).
- * @param {{content?:string}} msg
- * @returns {Promise<{adult:boolean,spam:boolean,confidence:number,reason:string}|null>} 사용 불가/오류 시 null
- */
-async function analyzeLinkMessage({ content } = {}) {
-  if (!(await isAvailable())) return null;
-
-  const prompt = `${LINK_MESSAGE_PROMPT}\nMESSAGE: ${(content || '').slice(0, 1500)}`;
-
-  try {
-    const res = await fetch(`${config.OLLAMA_URL}/api/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: config.OLLAMA_VLM_MODEL,
-        prompt,
-        stream: false,
-        format: 'json',
-        options: { temperature: 0 },
-      }),
-      signal: AbortSignal.timeout(config.OLLAMA_TIMEOUT_MS),
-    });
-
-    if (!res.ok) {
-      logger.warn('로컬 VLM 링크메시지 분석 응답 오류', { status: res.status });
-      return null;
-    }
-    const data = await res.json();
-    const parsed = parseServerJson(data.response || '');
-    if (!parsed) logger.warn('로컬 VLM 링크메시지 분석 JSON 파싱 실패', { raw: (data.response || '').slice(0, 200) });
-    return parsed;
-  } catch (e) {
-    logger.warn('로컬 VLM 링크메시지 분석 호출 실패', { error: e.message });
-    availability = { ok: false, checkedAt: Date.now() };
-    return null;
-  }
-}
-
 /**
  * @param {Buffer} buffer 이미지 원본 버퍼
  * @returns {Promise<{scam:boolean,confidence:number,reason:string}|null>} 사용 불가/오류 시 null
@@ -242,4 +184,4 @@ async function analyzeImage(buffer) {
   }
 }
 
-module.exports = { analyzeImage, analyzeDiscordServer, analyzeLinkMessage, isAvailable };
+module.exports = { analyzeImage, analyzeDiscordServer, isAvailable };
