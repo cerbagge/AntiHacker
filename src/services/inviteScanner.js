@@ -47,6 +47,7 @@ const CHANNEL_LINK_REGEX =
 const ADULT_KEYWORDS = [
   'porn', 'pornhub', 'hentai', 'onlyfans', ' xxx', 'xxx ', 'r-18', 'r18', '18+', '19+',
   'nsfw', 'sexchat', 'sexcam', 'escort', 'nude', 'nudes', 'camgirl', 'fansly',
+  '🔞', // "No One Under Eighteen" 표식 — 성인 서버가 이름/설명에 자주 다는 명백·저오탐 신호
   '야동', '성인방', '성인 방', '섹스', '섹트', '노출방', '후방주의', '음란',
 ];
 // 스팸/스캠 키워드(폴백용, 서버 이름·설명과 메시지 문구 공용) — 매우 distinctive 한 것만.
