@@ -155,8 +155,9 @@ async function classifyContentAi(text) {
   }
   if (!ai) return null; // 호출/파싱 실패 — 캐시하지 않음
 
+  // AI 단독으로는 삭제하지 않는다(오탐 위험) — 알림만 남기는 advisory 판정.
   const verdict = (ai.adult || ai.spam) && ai.confidence >= AI_DELETE_CONFIDENCE
-    ? { adult: !!ai.adult, spam: !!ai.spam, source: 'content-ai', detail: ai.reason || '', confidence: ai.confidence }
+    ? { adult: !!ai.adult, spam: !!ai.spam, source: 'content-ai', advisory: true, detail: ai.reason || '', confidence: ai.confidence }
     : null;
   setCache(cacheKey, verdict);
   return verdict;
@@ -176,17 +177,17 @@ function classifyServer({ nsfwLevel, name, description, ai } = {}) {
   if (isOfficialNsfw(nsfwLevel)) {
     return { flagged: true, adult: true, spam: false, source: 'nsfwLevel', detail: String(nsfwLevel), confidence: 1 };
   }
-  // b) AI (신뢰도 임계값 이상)
-  if (ai && (ai.adult || ai.spam) && ai.confidence >= AI_DELETE_CONFIDENCE) {
-    return { flagged: true, adult: !!ai.adult, spam: !!ai.spam, source: 'ai', detail: ai.reason || '', confidence: ai.confidence };
-  }
-  // c) 키워드 폴백
+  // b) 키워드 (노골적 토큰 — 삭제 근거로 충분)
   const hay = `${name || ''} ${description || ''}`.toLowerCase();
   for (const kw of ADULT_KEYWORDS) {
     if (hay.includes(kw)) return { flagged: true, adult: true, spam: false, source: 'keyword', detail: kw.trim(), confidence: KEYWORD_CONFIDENCE };
   }
   for (const kw of SPAM_KEYWORDS) {
     if (hay.includes(kw)) return { flagged: true, adult: false, spam: true, source: 'keyword', detail: kw.trim(), confidence: KEYWORD_CONFIDENCE };
+  }
+  // c) AI — 단독으로는 삭제하지 않는다(오탐 위험). 알림만 남기는 advisory 판정.
+  if (ai && (ai.adult || ai.spam) && ai.confidence >= AI_DELETE_CONFIDENCE) {
+    return { flagged: true, advisory: true, adult: !!ai.adult, spam: !!ai.spam, source: 'ai', detail: ai.reason || '', confidence: ai.confidence };
   }
   return null;
 }
@@ -222,6 +223,7 @@ function finalize(verdict, code, guild) {
     guildName: guild.name || '(unknown)',
     kind: verdict.adult ? 'adult' : 'spam',
     source: verdict.source,
+    advisory: !!verdict.advisory,
     detail: verdict.detail,
     confidence: verdict.confidence,
   };
@@ -296,6 +298,7 @@ function finalizeContentVerdict(content, codes, channelTargets, lang) {
     kind: content.adult ? 'adult' : 'spam',
     linkKind,
     source: content.source,
+    advisory: !!content.advisory,
     detail: content.detail,
     confidence: content.confidence,
     guildName: target,

@@ -254,12 +254,17 @@ async function handleHoneypot(message) {
 async function handleNsfwInviteDelete(message, verdict) {
   const lang = guildConfigStore.getLanguage(message.guild?.id);
 
+  // advisory: AI 단독 판정 — 오탐 위험이 커서 삭제·제재 없이 로그 알림만 남긴다.
+  const advisory = !!verdict.advisory;
+
   let deleted = false;
-  try {
-    await message.delete();
-    deleted = true;
-  } catch (e) {
-    logger.error('NSFW 초대 메시지 삭제 실패 (Manage Messages 권한 확인)', { error: e.message, guild: message.guild?.name });
+  if (!advisory) {
+    try {
+      await message.delete();
+      deleted = true;
+    } catch (e) {
+      logger.error('NSFW 초대 메시지 삭제 실패 (Manage Messages 권한 확인)', { error: e.message, guild: message.guild?.name });
+    }
   }
 
   const alert = alertStore.createAlert({
@@ -274,7 +279,7 @@ async function handleNsfwInviteDelete(message, verdict) {
     analysisDetails: { invite: { server: verdict.guildName, kind: verdict.kind, source: verdict.source } },
   });
 
-  logger.warn(`NSFW/스팸 서버 초대 ${deleted ? '삭제' : '감지(삭제실패)'} #${alert.id}`, {
+  logger.warn(`NSFW/스팸 서버 초대 ${advisory ? 'AI 의심(알림만)' : deleted ? '삭제' : '감지(삭제실패)'} #${alert.id}`, {
     author: message.author.tag,
     server: verdict.guildName,
     kind: verdict.kind,
@@ -286,7 +291,7 @@ async function handleNsfwInviteDelete(message, verdict) {
   const isChannelLink = verdict.linkKind === 'channel' || verdict.linkKind === 'dm';
   const embed = new EmbedBuilder()
     .setTitle(await tl(lang, isChannelLink ? 'title.channelLink' : 'title.invite'))
-    .setColor(0xed4245)
+    .setColor(advisory ? 0xfee75c : 0xed4245)
     .setThumbnail(message.author.displayAvatarURL())
     .addFields(
       { name: await tl(lang, 'field.author'), value: `${message.author.tag} (<@${message.author.id}>)`, inline: true },
@@ -294,8 +299,12 @@ async function handleNsfwInviteDelete(message, verdict) {
       { name: await tl(lang, 'field.server'), value: (verdict.guildName || '-').slice(0, 256), inline: true },
     )
     .setTimestamp();
-  await addNoPermNotice(embed, deleted, lang);
-  await addSanctionField(embed, message, lang);
+  if (advisory) {
+    embed.setDescription(`AI 단독 판정이라 **삭제하지 않았습니다** — 확인 후 수동 조치하세요.\n${(verdict.reason || '').slice(0, 300)}`);
+  } else {
+    await addNoPermNotice(embed, deleted, lang);
+    await addSanctionField(embed, message, lang);
+  }
 
   await guildLogger.logToGuild(message.client, message.guild?.id, { embeds: [embed] });
 
