@@ -1,21 +1,23 @@
 /**
  * 디스코드 초대 가드 — 메시지에 든 디스코드 링크(초대/채널)를 검사한다.
- * 링크가 있다는 사실만으로는 차단하지 않는다. 차단 조건은 두 가지뿐:
+ * 링크가 있다는 사실만으로는 차단하지 않는다. 판단 근거는 언제나 "대상 서버"이며,
+ * 함께 적힌 문구(멘션/광고 문구)로는 삭제하지 않는다. 차단 경로는 두 가지:
  *
- *   A) 초대 링크 — 판단 근거는 오직 초대 대상 서버다 (흐름: 싼 것 → 비싼 것).
- *      멘션(@everyone 등)이나 함께 적힌 문구가 스팸처럼 보여도 대상 서버가 정상이면 통과.
+ *   A) 초대 링크 — 초대 대상 서버로 판단 (흐름: 싼 것 → 비싼 것).
  *      1) 초대코드 추출 (discord.gg/CODE, discord.com/invite/CODE 등)
  *      2) client.fetchInvite(code) 로 대상 길드 메타(name/description/icon/nsfwLevel) 해석
- *      3) 판정(classifyServer, 순수):
- *           a. 공식 nsfwLevel == Explicit(1) | AgeRestricted(3) → 성인(즉시, AI 불필요)
- *           b. 로컬 AI(VLM)가 이름+설명+아이콘 보고 adult/spam 판정 (신뢰도 임계값 이상)
- *           c. AI 불가/미달 시 노골적 키워드 폴백
  *
- *   B) 채널/DM 딥링크만 있는 메시지 (초대 링크 없음) — 대상 서버를 해석할 수 없으므로,
- *      링크를 뺀 나머지 문구를 키워드(비용 0) → 로컬 AI(신뢰도 임계값 이상) 순으로 판정
- *      (통화방 유인 스팸 등). 친구끼리의 통화방 초대처럼 문구가 정상이면 통과.
+ *   B) 채널 딥링크 (discord.com/channels/<서버ID>/<채널ID>) — 대상 서버로 판단.
+ *      1) 링크의 서버ID로 client.guilds.fetch(id) 로 길드 메타 해석
+ *      2) 단, 봇이 함께 가입한 서버만 ID로 조회 가능하다. 미가입 외부 서버와
+ *         DM 딥링크(/@me/…)는 대상 서버를 해석할 수 없으므로 통과.
  *
- * 도배 보호: 메시지당 초대 상한, 코드/문구별 결과 캐시(TTL), AI 호출은 imageQueue 슬롯으로 동시성 제한.
+ *   공통 판정(classifyServer, 순수):
+ *      a. 공식 nsfwLevel == Explicit(1) | AgeRestricted(3) → 성인(즉시, AI 불필요)
+ *      b. 로컬 AI(VLM)가 이름+설명+아이콘 보고 adult/spam 판정 (신뢰도 임계값 이상)
+ *      c. AI 불가/미달 시 노골적 키워드 폴백
+ *
+ * 도배 보호: 메시지당 링크 상한, 코드/길드별 결과 캐시(TTL), AI 호출은 imageQueue 슬롯으로 동시성 제한.
  */
 const config = require('../config');
 const logger = require('../utils/logger');
@@ -38,8 +40,8 @@ const CACHE_MAX = 500;
 const INVITE_REGEX =
   /(?:https?:\/\/)?(?:(?:canary|ptb)\.)?(?:discord(?:app)?\.com\/invite|discord\.gg)\/([a-z0-9-]{2,64})/gi;
 
-// 채널 딥링크 추출 — discord.com/channels/<서버ID|@me>/<채널ID>. 초대가 아니라 이미 가입한 곳으로 보내는 점프 링크.
-// 링크 자체는 차단하지 않고, 이 링크가 있으면 메시지 문구를 내용 기반으로 판정하는 트리거로만 쓴다.
+// 채널 딥링크 추출 — discord.com/channels/<서버ID|@me>/<채널ID>. 서버ID가 있으면 그 길드를 해석해 판정한다.
+// (DM 딥링크 @me 는 대상 서버가 없어 해석 불가 → 통과)
 const CHANNEL_LINK_REGEX =
   /(?:https?:\/\/)?(?:(?:canary|ptb)\.)?discord(?:app)?\.com\/channels\/(@me|\d{5,25})\/(\d{5,25})/gi;
 
@@ -216,6 +218,15 @@ async function resolveInvite(client, code) {
   }
 }
 
+/** 채널 딥링크의 서버ID로 길드 해석 — 봇이 함께 가입한 서버만 조회됨. 미가입/접근불가면 null(통과) */
+async function resolveGuild(client, guildId) {
+  try {
+    return await client.guilds.fetch(guildId);
+  } catch (e) {
+    return null;
+  }
+}
+
 function finalize(verdict, code, guild) {
   return {
     code,
@@ -227,6 +238,42 @@ function finalize(verdict, code, guild) {
     detail: verdict.detail,
     confidence: verdict.confidence,
   };
+}
+
+/**
+ * 해석된 길드(초대 대상/채널 링크 대상 공용)를 판정 → classifyServer verdict|null.
+ * 공식 등급이면 즉시, 아니면 로컬 AI(가용 + 슬롯 확보 시) → 키워드 폴백.
+ */
+async function analyzeGuildVerdict(guild, logCtx = {}) {
+  const name = guild.name;
+  const description = guild.description;
+  const nsfwLevel = guild.nsfwLevel;
+
+  // a) 공식 등급이면 즉시(AI 불필요)
+  if (isOfficialNsfw(nsfwLevel)) {
+    return { adult: true, spam: false, source: 'nsfwLevel', detail: String(nsfwLevel), confidence: 1 };
+  }
+
+  // b) 로컬 AI 분석 (VLM 가용 + 큐 슬롯 확보 시에만)
+  let ai = null;
+  if (config.SCAM_VLM_ENABLED && (await localVlmService.isAvailable())) {
+    const slot = await imageQueue.acquire();
+    if (slot) {
+      try {
+        let iconBuffer = null;
+        const iconUrl = typeof guild.iconURL === 'function' ? guild.iconURL({ extension: 'png', size: 128 }) : null;
+        if (iconUrl) iconBuffer = await downloadImage(iconUrl);
+        ai = await localVlmService.analyzeDiscordServer({ name, description, iconBuffer });
+      } catch (e) {
+        logger.warn('대상 서버 AI 분석 실패', { ...logCtx, error: e.message });
+      } finally {
+        imageQueue.release();
+      }
+    }
+  }
+
+  // c) 최종 판정(AI + 키워드 폴백)
+  return classifyServer({ nsfwLevel, name, description, ai });
 }
 
 /**
@@ -242,51 +289,32 @@ async function analyzeInvite(client, code, ownGuildId) {
   if (!guild || !guild.id) { setCache(code, null); return null; } // 그룹DM/해석실패
   if (ownGuildId && guild.id === ownGuildId) { setCache(code, null); return null; } // 자기 서버 초대
 
-  const name = guild.name;
-  const description = guild.description;
-  const nsfwLevel = guild.nsfwLevel;
-
-  // a) 공식 등급이면 즉시(AI 불필요)
-  if (isOfficialNsfw(nsfwLevel)) {
-    const out = finalize({ adult: true, spam: false, source: 'nsfwLevel', detail: String(nsfwLevel), confidence: 1 }, code, guild);
-    setCache(code, out);
-    return out;
-  }
-
-  // b) 로컬 AI 분석 (VLM 가용 + 큐 슬롯 확보 시에만)
-  let ai = null;
-  if (config.SCAM_VLM_ENABLED && (await localVlmService.isAvailable())) {
-    const slot = await imageQueue.acquire();
-    if (slot) {
-      try {
-        let iconBuffer = null;
-        const iconUrl = typeof guild.iconURL === 'function' ? guild.iconURL({ extension: 'png', size: 128 }) : null;
-        if (iconUrl) iconBuffer = await downloadImage(iconUrl);
-        ai = await localVlmService.analyzeDiscordServer({ name, description, iconBuffer });
-      } catch (e) {
-        logger.warn('초대 대상 서버 AI 분석 실패', { code, error: e.message });
-      } finally {
-        imageQueue.release();
-      }
-    }
-  }
-
-  // c) 최종 판정(AI + 키워드 폴백)
-  const verdict = classifyServer({ nsfwLevel, name, description, ai });
+  const verdict = await analyzeGuildVerdict(guild, { code });
   const out = verdict ? finalize(verdict, code, guild) : null;
   setCache(code, out);
   return out;
 }
 
-/** 사유 문자열(서버 언어) 생성 */
-function buildReason(v, lang) {
-  const server = `\`${(v.guildName || '').slice(0, 80)}\``;
-  if (v.kind === 'adult') {
-    return v.source === 'nsfwLevel'
-      ? t(lang, 'reason.inviteNsfwLevel', { server })
-      : t(lang, 'reason.inviteAdult', { server, detail: (v.detail || '').slice(0, 120) });
-  }
-  return t(lang, 'reason.inviteSpam', { server, detail: (v.detail || '').slice(0, 120) });
+// 대상 길드를 해석하지 못했음을 나타내는 표식 (정상 판정인 null 과 구분).
+const UNRESOLVED = Object.freeze({ unresolved: true });
+
+/**
+ * 채널 딥링크 하나 분석 (대상 서버ID로 길드 해석 후 초대와 동일 판정). flagged 면 verdict, 아니면 null.
+ * 봇이 함께 가입한 서버만 해석 가능 — 미가입 외부 서버는 통과. linkKind='channel' 로 표시.
+ */
+async function analyzeChannelLink(client, guildId) {
+  const cacheKey = `ch:${guildId}`;
+  const cached = getCache(cacheKey);
+  if (cached !== undefined) return cached;
+
+  const guild = await resolveGuild(client, guildId);
+  // 봇 미가입/접근불가 → 해석불가. 정상 서버(verdict 없음)와 구분해야 문구 폴백 여부를 정할 수 있다.
+  if (!guild || !guild.id) { setCache(cacheKey, UNRESOLVED); return UNRESOLVED; }
+
+  const verdict = await analyzeGuildVerdict(guild, { guildId });
+  const out = verdict ? { ...finalize(verdict, null, guild), linkKind: 'channel' } : null;
+  setCache(cacheKey, out);
+  return out;
 }
 
 /** 내용 기반 verdict 생성 — 어떤 링크와 함께 적혔는지(linkKind/대상)를 붙여서 반환 */
@@ -308,11 +336,25 @@ function finalizeContentVerdict(content, codes, channelTargets, lang) {
   };
 }
 
+/** 사유 문자열(서버 언어) 생성 — 링크 종류(초대/채널)에 맞는 키 사용 */
+function buildReason(v, lang) {
+  const server = `\`${(v.guildName || '').slice(0, 80)}\``;
+  const detail = (v.detail || '').slice(0, 120);
+  const ch = v.linkKind === 'channel';
+  if (v.kind === 'adult') {
+    return v.source === 'nsfwLevel'
+      ? t(lang, ch ? 'reason.channelNsfwLevel' : 'reason.inviteNsfwLevel', { server })
+      : t(lang, ch ? 'reason.channelAdult' : 'reason.inviteAdult', { server, detail });
+  }
+  return t(lang, ch ? 'reason.channelSpam' : 'reason.inviteSpam', { server, detail });
+}
+
 /**
  * 메시지의 디스코드 링크(초대/채널)를 검사 → 첫 번째 flagged verdict 반환(없으면 null).
  * 링크가 없으면 비용 0으로 통과. 링크가 있어도 그 자체로는 차단하지 않고,
  * ① 초대 링크는 대상 서버(이름/설명/공식등급/아이콘)가 성인/스팸일 때만,
- * ② 채널/DM 딥링크만 있으면 함께 적힌 문구가 스팸/성인 유인일 때만 차단.
+ * ② 채널 딥링크는 서버ID로 대상 길드를 해석(봇 공동 가입 서버만)해 성인/스팸일 때만 차단.
+ *    DM 딥링크(@me)·봇 미가입 외부 서버는 해석 불가라 통과.
  * @param {import('discord.js').Client} client
  * @param {string} text
  * @param {string} ownGuildId
@@ -336,8 +378,23 @@ async function scanMessageInvites(client, text, ownGuildId, lang = DEFAULT_LANG)
     return null;
   }
 
-  // 채널/DM 딥링크만 있는 메시지 — 대상 서버를 해석할 수 없으므로 문구로 판정.
-  // 키워드(비용 0) → 문구 AI 순. 유인 문구(통화방 스팸 등)가 확실할 때만 차단.
+  // 채널 딥링크 — ① 서버ID로 대상 길드를 해석해 초대와 동일하게 서버 자체로 판단(정확).
+  //   봇이 함께 가입한 서버만 해석된다.
+  let resolvedAny = false;
+  for (const { guild } of channelTargets.slice(0, MAX_INVITES_PER_MESSAGE)) {
+    if (guild === '@me') continue; // DM 딥링크 — 대상 서버 없음
+    const v = await analyzeChannelLink(client, guild);
+    if (v === UNRESOLVED) continue; // 봇 미가입 → 아래 문구 폴백 대상
+    resolvedAny = true;
+    if (v) {
+      v.reason = buildReason(v, lang);
+      return v;
+    }
+  }
+  if (resolvedAny) return null; // 대상 서버를 해석했고 정상 → 문구는 보지 않는다
+
+  // ② 해석 불가(봇 미가입 외부 서버·DM 딥링크)일 때만 문구로 판정.
+  //   키워드는 삭제, AI 단독은 advisory(알림만).
   let content = classifyContentKeywords(text);
   if (!content) content = await classifyContentAi(text);
   if (!content) return null;

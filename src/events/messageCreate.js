@@ -109,10 +109,10 @@ module.exports = (client) => {
       }
 
       // ── 디스코드 초대 가드 ──
-      // 메시지의 디스코드 링크(초대/채널)를 검사 — 링크 자체로는 차단하지 않고,
+      // 메시지의 디스코드 링크(초대/채널)를 검사 — 링크 자체로는 차단하지 않고 언제나 대상 서버로 판단.
       // ① 초대 링크는 멘션/문구와 무관하게 대상 서버를 해석해 19+(성인)/스팸일 때만,
-      // ② 채널/DM 딥링크만 있으면 문구가 스팸/성인 유인(통화방 유인 스팸 등)일
-      // 확률이 높을 때만 삭제. (링크가 없으면 비용 0으로 통과)
+      // ② 채널 딥링크는 서버ID로 대상 길드를 해석(봇 공동 가입 서버만)해 성인/스팸일 때만 삭제.
+      //    DM 딥링크(@me)·미가입 외부 서버는 해석 불가라 통과. (링크가 없으면 비용 0으로 통과)
       if (config.INVITE_GUARD_ENABLED && message.guild) {
         const inviteVerdict = await inviteScanner.scanMessageInvites(message.client, allContent, message.guild.id, lang);
         if (inviteVerdict) {

@@ -4,7 +4,7 @@
  *  - en/ko : 손으로 쓴 언어팩 (즉시)
  *  - 그 외 : 영어 베이스를 Google 번역(MT, 캐시). 번역 불가 시 영어 폴백.
  */
-const { EmbedBuilder, AttachmentBuilder } = require('discord.js');
+const { EmbedBuilder, AttachmentBuilder, RESTJSONErrorCodes } = require('discord.js');
 const config = require('../config');
 const logger = require('../utils/logger');
 const alertStore = require('./alertStore');
@@ -17,10 +17,56 @@ const { tl } = require('./i18n');
 
 const ZWSP = '​'; // 빈 필드명용 제로폭 공백
 
-/** 삭제 실패 시 "메시지 관리 권한 필요" 경고(굵게)를 하단에 추가 */
-async function addNoPermNotice(embed, deleted, lang) {
-  if (!deleted) embed.addFields({ name: ZWSP, value: `**${await tl(lang, 'notice.noPerm')}**` });
+/**
+ * 메시지 삭제 시도 — 실패 원인을 코드로 구분한다.
+ * message.delete() 실패를 무조건 "메시지 관리 권한 부족"으로 단정하지 않기 위함.
+ * 서버 역할에는 권한이 있어도 아래 이유로 실패할 수 있다:
+ *   - already-gone(10008): 이미 삭제됨 → 목적 달성(경고 불필요, deleted=true 로 취급)
+ *   - missing-perms(50013): 이 채널에서 "메시지 관리" 없음 — 대개 채널/카테고리 권한 재정의(overwrite)
+ *                            또는 봇 자신이 타임아웃된 상태
+ *   - missing-access(50001): 채널 접근 불가(채널 보기 없음 등)
+ *   - error: 그 외(일시 오류/레이트리밋 등)
+ * @returns {Promise<{deleted:boolean, cause:'ok'|'already-gone'|'missing-perms'|'missing-access'|'error', error?:string}>}
+ */
+async function tryDeleteMessage(message) {
+  try {
+    await message.delete();
+    return { deleted: true, cause: 'ok' };
+  } catch (e) {
+    switch (e?.code) {
+      case RESTJSONErrorCodes.UnknownMessage:
+        return { deleted: true, cause: 'already-gone' };
+      case RESTJSONErrorCodes.MissingPermissions:
+        return { deleted: false, cause: 'missing-perms', error: e.message };
+      case RESTJSONErrorCodes.MissingAccess:
+        return { deleted: false, cause: 'missing-access', error: e.message };
+      default:
+        return { deleted: false, cause: 'error', error: e.message };
+    }
+  }
+}
+
+// 삭제 실패 원인 → 로그 채널에 붙일 안내 문구 키 (성공/이미삭제는 안내 없음)
+const DELETE_FAILURE_NOTICE_KEY = {
+  'missing-perms': 'notice.noPermChannel',
+  'missing-access': 'notice.noAccess',
+  error: 'notice.deleteFailed',
+};
+
+/** 삭제 실패 시 원인에 맞는 경고(굵게)를 하단에 추가. 성공/이미삭제면 아무것도 안 함. */
+async function addDeleteFailureNotice(embed, del, lang) {
+  const key = DELETE_FAILURE_NOTICE_KEY[del.cause];
+  if (key) embed.addFields({ name: ZWSP, value: `**${await tl(lang, key)}**` });
   return embed;
+}
+
+/** 삭제 실패 원인을 정확히 로그 — 무조건 "권한 확인"으로 찍지 않는다(진짜 원인은 cause/error 에). */
+function logDeleteFailure(label, del, message) {
+  logger.error(`${label} 삭제 실패 [${del.cause}]`, {
+    error: del.error,
+    guild: message.guild?.name,
+    channel: message.channel?.id,
+  });
 }
 
 /**
@@ -54,10 +100,10 @@ async function addSanctionField(embed, message, lang) {
   return embed;
 }
 
-async function buildScamEmbed(message, trigger, deleted, lang) {
+async function buildScamEmbed(message, trigger, del, lang) {
   const embed = new EmbedBuilder()
     .setTitle(await tl(lang, 'title.scam'))
-    .setColor(deleted ? 0xed4245 : 0xfee75c)
+    .setColor(del.deleted ? 0xed4245 : 0xfee75c)
     .setThumbnail(message.author.displayAvatarURL())
     .addFields(
       { name: await tl(lang, 'field.author'), value: `${message.author.tag} (<@${message.author.id}>)`, inline: true },
@@ -65,7 +111,7 @@ async function buildScamEmbed(message, trigger, deleted, lang) {
     )
     .setTimestamp();
   // 근거(trigger.reason)는 노출하지 않고 기록용으로만 — logger.warn + alertStore 에 남는다.
-  return addNoPermNotice(embed, deleted, lang);
+  return addDeleteFailureNotice(embed, del, lang);
 }
 
 /**
@@ -76,13 +122,8 @@ async function handleScamDelete(message, scanResult) {
   const trigger = scanResult.trigger;
   const lang = guildConfigStore.getLanguage(message.guild?.id);
 
-  let deleted = false;
-  try {
-    await message.delete();
-    deleted = true;
-  } catch (e) {
-    logger.error('스캠 메시지 삭제 실패 (Manage Messages 권한 확인)', { error: e.message, guild: message.guild?.name });
-  }
+  const del = await tryDeleteMessage(message);
+  if (!del.deleted) logDeleteFailure('스캠 메시지', del, message);
 
   const alert = alertStore.createAlert({
     guildId: message.guild?.id,
@@ -96,7 +137,7 @@ async function handleScamDelete(message, scanResult) {
     analysisDetails: { scam: trigger },
   });
 
-  logger.warn(`코인 스캠 이미지 ${deleted ? '삭제' : '감지(삭제실패)'} #${alert.id}`, {
+  logger.warn(`코인 스캠 이미지 ${del.deleted ? '삭제' : '감지(삭제실패)'} #${alert.id}`, {
     author: message.author.tag,
     danger: trigger.dangerPercent,
     signals: trigger.signals,
@@ -104,7 +145,7 @@ async function handleScamDelete(message, scanResult) {
     source: trigger.source,
   });
 
-  const embed = await buildScamEmbed(message, trigger, deleted, lang);
+  const embed = await buildScamEmbed(message, trigger, del, lang);
   await addSanctionField(embed, message, lang);
   // 첨부는 전송할 때마다 새로 생성(스트림 재사용 문제 방지)
   const makeFiles = () =>
@@ -122,13 +163,8 @@ async function handleScamDelete(message, scanResult) {
 async function handleVirusDelete(message, attachment, scan) {
   const lang = guildConfigStore.getLanguage(message.guild?.id);
 
-  let deleted = false;
-  try {
-    await message.delete();
-    deleted = true;
-  } catch (e) {
-    logger.error('바이러스 메시지 삭제 실패 (Manage Messages 권한 확인)', { error: e.message, guild: message.guild?.name });
-  }
+  const del = await tryDeleteMessage(message);
+  if (!del.deleted) logDeleteFailure('바이러스 메시지', del, message);
 
   const alert = alertStore.createAlert({
     guildId: message.guild?.id,
@@ -142,7 +178,7 @@ async function handleVirusDelete(message, attachment, scan) {
     analysisDetails: { virus: { file: attachment.name, signatures: scan.signatures || [] } },
   });
 
-  logger.warn(`바이러스 첨부 ${deleted ? '삭제' : '감지(삭제실패)'} #${alert.id}`, {
+  logger.warn(`바이러스 첨부 ${del.deleted ? '삭제' : '감지(삭제실패)'} #${alert.id}`, {
     author: message.author.tag,
     file: attachment.name,
     signatures: scan.signatures,
@@ -158,7 +194,7 @@ async function handleVirusDelete(message, attachment, scan) {
       { name: await tl(lang, 'field.file'), value: (attachment.name || '-').slice(0, 256), inline: true },
     )
     .setTimestamp();
-  await addNoPermNotice(embed, deleted, lang);
+  await addDeleteFailureNotice(embed, del, lang);
   await addSanctionField(embed, message, lang);
 
   await guildLogger.logToGuild(message.client, message.guild?.id, { embeds: [embed] });
@@ -173,13 +209,8 @@ async function handleVirusDelete(message, attachment, scan) {
 async function handleHoneypot(message) {
   const lang = guildConfigStore.getLanguage(message.guild?.id);
 
-  let deleted = false;
-  try {
-    await message.delete();
-    deleted = true;
-  } catch (e) {
-    logger.error('허니팟 메시지 삭제 실패 (Manage Messages 권한 확인)', { error: e.message, guild: message.guild?.name });
-  }
+  const del = await tryDeleteMessage(message);
+  if (!del.deleted) logDeleteFailure('허니팟 메시지', del, message);
 
   const alert = alertStore.createAlert({
     guildId: message.guild?.id,
@@ -193,7 +224,7 @@ async function handleHoneypot(message) {
     analysisDetails: { honeypot: true },
   });
 
-  logger.warn(`허니팟 적발 ${deleted ? '삭제' : '감지(삭제실패)'} #${alert.id}`, {
+  logger.warn(`허니팟 적발 ${del.deleted ? '삭제' : '감지(삭제실패)'} #${alert.id}`, {
     author: message.author.tag,
     channel: message.channel.id,
   });
@@ -237,7 +268,7 @@ async function handleHoneypot(message) {
       value: await tl(lang, 'sweep.summary', { total: sweep.deleted, time: sweep.byTime, content: sweep.byContent, channels: sweep.channels }),
     });
   }
-  await addNoPermNotice(embed, deleted, lang);
+  await addDeleteFailureNotice(embed, del, lang);
   await addSanctionField(embed, message, lang);
 
   await guildLogger.logToGuild(message.client, message.guild?.id, { embeds: [embed] });
@@ -257,14 +288,10 @@ async function handleNsfwInviteDelete(message, verdict) {
   // advisory: AI 단독 판정 — 오탐 위험이 커서 삭제·제재 없이 로그 알림만 남긴다.
   const advisory = !!verdict.advisory;
 
-  let deleted = false;
+  let del = { deleted: false, cause: 'skipped' }; // advisory 는 삭제를 시도하지 않음(실패 안내도 없음)
   if (!advisory) {
-    try {
-      await message.delete();
-      deleted = true;
-    } catch (e) {
-      logger.error('NSFW 초대 메시지 삭제 실패 (Manage Messages 권한 확인)', { error: e.message, guild: message.guild?.name });
-    }
+    del = await tryDeleteMessage(message);
+    if (!del.deleted) logDeleteFailure('NSFW 초대 메시지', del, message);
   }
 
   const alert = alertStore.createAlert({
@@ -279,7 +306,7 @@ async function handleNsfwInviteDelete(message, verdict) {
     analysisDetails: { invite: { server: verdict.guildName, kind: verdict.kind, source: verdict.source } },
   });
 
-  logger.warn(`NSFW/스팸 서버 초대 ${advisory ? 'AI 의심(알림만)' : deleted ? '삭제' : '감지(삭제실패)'} #${alert.id}`, {
+  logger.warn(`NSFW/스팸 서버 초대 ${advisory ? 'AI 의심(알림만)' : del.deleted ? '삭제' : '감지(삭제실패)'} #${alert.id}`, {
     author: message.author.tag,
     server: verdict.guildName,
     kind: verdict.kind,
@@ -302,7 +329,7 @@ async function handleNsfwInviteDelete(message, verdict) {
   if (advisory) {
     embed.setDescription(`AI 단독 판정이라 **삭제하지 않았습니다** — 확인 후 수동 조치하세요.\n${(verdict.reason || '').slice(0, 300)}`);
   } else {
-    await addNoPermNotice(embed, deleted, lang);
+    await addDeleteFailureNotice(embed, del, lang);
     await addSanctionField(embed, message, lang);
   }
 
@@ -311,4 +338,8 @@ async function handleNsfwInviteDelete(message, verdict) {
   return alert.id;
 }
 
-module.exports = { handleScamDelete, handleVirusDelete, handleHoneypot, handleNsfwInviteDelete };
+module.exports = {
+  handleScamDelete, handleVirusDelete, handleHoneypot, handleNsfwInviteDelete,
+  // 단위 테스트/재사용용
+  tryDeleteMessage, addDeleteFailureNotice,
+};
