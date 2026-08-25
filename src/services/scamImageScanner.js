@@ -10,6 +10,8 @@
  *
  * 결과의 dangerPercent / 임계값으로 자동삭제 여부를 정한다. 오삭제를 막기 위해
  * 자동삭제는 "점수 임계값 이상 + 서로 다른 신호 2종류 이상"을 모두 만족해야 한다.
+ * VLM은 로컬이 이미 의심한 건을 확정으로 올릴 수만 있고, 로컬 근거 없이 단독으로
+ * 삭제를 만들지 못한다 (AI 단독 판정 = 의심 → 관리자 알림만).
  */
 const { createWorker } = require('tesseract.js');
 const Jimp = require('jimp');
@@ -279,14 +281,15 @@ async function scanImage(buffer, mimeType, messageText, lang = DEFAULT_LANG) {
     || (tags.casino && tags.crypto && tags.money)
     || (tags.casino && tags.proof)
   );
-  let autoDelete = Boolean(
+  const localAutoDelete = Boolean(
     (score >= autoThreshold && tagCount >= 2)
     || (decisiveCombo && score >= SUSPICIOUS_THRESHOLD)
   );
+  let autoDelete = localAutoDelete;
   let suspicious = score >= SUSPICIOUS_THRESHOLD;
   const signals = [...Object.keys(tags)];
 
-  // 5) 로컬 VLM 보강 — 자동삭제는 아니지만 스캠 신호 조합이 있으면 VLM이 눈으로 최종 판정.
+  // 5) 로컬 VLM 보강 — 자동삭제는 아니지만 스캠 신호 조합이 있으면 VLM이 눈으로 재확인.
   //    (순수 양성 이미지 = 신호 0개는 VLM을 부르지 않아 CPU 비용을 묶어둔다.)
   const strongTag = tags.giveaway || tags.wallet || tags.url || tags.casino || tags.celebrity;
   const lowTextHint = ocrText.trim().length < 40 && (tags.crypto || tags.qr);
@@ -298,24 +301,32 @@ async function scanImage(buffer, mimeType, messageText, lang = DEFAULT_LANG) {
     || lowTextHint
   );
 
+  // VLM은 "의심을 확정으로 올리는" 역할만 한다 — 없던 판정을 혼자 만들지 못한다.
+  // 로컬이 스스로 의심(점수 45+)으로 보고, 서로 다른 신호가 2종류 이상일 때만 VLM 확정을 인정.
+  // (오탐 사례: 카지노 삭제 공지 스크린샷 → 로컬은 "카지노" 한 단어 30점뿐인데
+  //  3B VLM이 없는 유명인 사칭을 봤다며 0.95로 단정 → 삭제 + 자동 킥)
+  const localCorroborated = tagCount >= 2 && score >= SUSPICIOUS_THRESHOLD;
+
   if (candidate) {
     const vlm = await localVlmService.analyzeImage(buffer);
     if (vlm) {
       signals.push(`vlm(scam=${vlm.scam},conf=${vlm.confidence.toFixed(2)})`);
-      if (vlm.scam && vlm.confidence >= 0.8) {
+      if (vlm.scam && vlm.confidence >= 0.8 && localCorroborated) {
         autoDelete = true;
         suspicious = true;
         score = Math.max(score, 90);
         reasons.push(t(lang, 'reason.vlmScam', { pct: Math.round(vlm.confidence * 100), detail: vlm.reason }));
       } else if (vlm.scam && vlm.confidence >= 0.5) {
+        // 로컬 뒷받침이 없는 AI 단독 판정 → 삭제·제재 없이 관리자 알림만(의심)
         suspicious = true;
         reasons.push(t(lang, 'reason.vlmSuspect', { pct: Math.round(vlm.confidence * 100), detail: vlm.reason }));
       }
     }
   }
 
-  // 고신뢰 자동삭제로 확정되면 → 해시 블록리스트에 등록(이후 동일 이미지 즉시 차단)
-  if (autoDelete && imgHash && !known) {
+  // 해시 블록리스트는 이후 OCR/AI 없이 100%로 즉시 삭제하는 fast-path라 오탐이 영구히 굳는다.
+  // → AI가 개입하지 않은 로컬 확정 삭제만 학습한다.
+  if (localAutoDelete && imgHash && !known) {
     scamHashStore.addScamHash(imgHash);
   }
 
