@@ -5,6 +5,7 @@ credentials.json
 token.json
 client_secret_*.json
 scamHashes.json
+scamHashes.json.legacy-*
 _scamtest.js
 
 # 런타임 상태/설정 (서버·채널·유저 ID 등 개인정보 포함 → 공개 금지)

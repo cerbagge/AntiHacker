@@ -110,15 +110,26 @@ const MONEY = /(\$\s?\d[\d.,]*)|(\b\d[\d.,]*\s?(usdt|usdc|btc|eth|trx|usd|dollar
 // OCR 텍스트엔 http:// 없는 맨 도메인(hexowin.net, hexowin149.pro 등)이 흔하다 → 따로 추출
 const BARE_DOMAIN = /\b((?:[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?\.)+(?:com|net|org|io|pro|xyz|app|site|live|vip|win|club|info|biz|online|fund|gift|cash|top|cc|gg))(\/[^\s]*)?/gi;
 
-/** {en, ko} 그룹에서 서로 다른 토큰이 몇 개 매칭되는지 */
+/**
+ * {en, ko} 그룹에서 겹치지 않는 매칭이 몇 개인지. 긴 토큰부터 매칭하고 매칭된 구간을 지워서
+ * "실현손익"⊃"손익", "unrealized pnl"⊃"pnl" 처럼 한 단어가 두 번 세어지지 않게 한다.
+ */
 function countGroup(textLower, group) {
+  const tokens = [
+    ...(group.ko || []).map((t) => ({ t: t.toLowerCase(), en: false })),
+    ...(group.en || []).map((t) => ({ t: t.toLowerCase(), en: true })),
+  ].sort((a, b) => b.t.length - a.t.length);
+
+  let text = textLower;
   let n = 0;
-  for (const ko of group.ko || []) {
-    if (ko && textLower.includes(ko.toLowerCase())) n++;
-  }
-  for (const en of group.en || []) {
-    const re = new RegExp(`(^|[^a-z0-9])${escapeRegExp(en.toLowerCase())}([^a-z0-9]|$)`, 'i');
-    if (re.test(textLower)) n++;
+  for (const { t, en } of tokens) {
+    const re = en
+      ? new RegExp(`(?<![a-z0-9])${escapeRegExp(t)}(?![a-z0-9])`, 'i')
+      : new RegExp(escapeRegExp(t));
+    const m = re.exec(text);
+    if (!m) continue;
+    n++;
+    text = `${text.slice(0, m.index)}${' '.repeat(m[0].length)}${text.slice(m.index + m[0].length)}`;
   }
   return n;
 }
@@ -464,19 +475,19 @@ async function scanMessageImages(imageAttachments, messageText, prefetched, lang
       continue;
     }
 
-    // PDF → 앞 페이지 PNG 들로 펼쳐 각각 이미지처럼 스캔 (텍스트 레이어·링크는 동봉 텍스트로)
+    // PDF → 앞 페이지 PNG 들로 펼쳐 각각 이미지처럼 스캔 (그 페이지의 텍스트·링크만 동봉 텍스트로)
     let targets = [{ buffer, name: att.name, mime: att.contentType, text: messageText }];
     if (pdfRenderer.isPdfAttachment(att)) {
-      const pdf = await pdfRenderer.renderPdf(buffer);
-      if (!pdf) {
+      const pages = await pdfRenderer.renderPdf(buffer);
+      if (!pages) {
         scanned.push({ url: att.url, buffer: null, result: null });
         continue;
       }
-      targets = pdf.pages.map((page, i) => ({
-        buffer: page,
+      targets = pages.map((page, i) => ({
+        buffer: page.image,
         name: `${att.name}_p${i + 1}.png`,
         mime: 'image/png',
-        text: `${messageText || ''}\n${pdf.text}`,
+        text: `${messageText || ''}\n${page.text}`,
       }));
     }
 

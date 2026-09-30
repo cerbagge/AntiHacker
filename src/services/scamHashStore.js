@@ -19,11 +19,25 @@ const HASH_PATH = path.join(__dirname, '..', '..', 'scamHashes.json');
 const DEFAULT_MAX_DISTANCE = 10;
 const MAX_ENTRIES = 5000; // 과도한 증가 방지
 
+// 학습 규칙이 바뀌면 올린다. 이전 버전 해시는 새 규칙이라면 학습되지 않았을 오탐
+// (예: v1 은 AI 확정·거래 화면 스크린샷도 학습)을 담고 있을 수 있고, fast-path 가 새 화이트리스트보다
+// 먼저 돌아 영구 삭제로 굳는다 → 버리고 다시 학습한다. 원본은 .legacy 파일로 보관.
+const STORE_VERSION = 2;
+
 let hashes = [];
 try {
   if (fs.existsSync(HASH_PATH)) {
-    hashes = JSON.parse(fs.readFileSync(HASH_PATH, 'utf-8'));
-    if (!Array.isArray(hashes)) hashes = [];
+    const data = JSON.parse(fs.readFileSync(HASH_PATH, 'utf-8'));
+    if (data && data.version === STORE_VERSION && Array.isArray(data.hashes)) {
+      hashes = data.hashes;
+    } else {
+      const legacyPath = `${HASH_PATH}.legacy-v${(data && data.version) || 1}`;
+      fs.renameSync(HASH_PATH, legacyPath);
+      logger.info('이전 규칙으로 학습된 스캠 해시 폐기 — 새로 학습', {
+        dropped: Array.isArray(data) ? data.length : (data && data.hashes ? data.hashes.length : 0),
+        backup: path.basename(legacyPath),
+      });
+    }
   }
 } catch (e) {
   logger.warn('scamHashes.json 로드 실패', { error: e.message });
@@ -32,7 +46,8 @@ try {
 
 function save() {
   try {
-    fs.writeFileSync(HASH_PATH, JSON.stringify(hashes.slice(-MAX_ENTRIES), null, 0));
+    const data = { version: STORE_VERSION, hashes: hashes.slice(-MAX_ENTRIES) };
+    fs.writeFileSync(HASH_PATH, JSON.stringify(data, null, 0));
   } catch (e) {
     logger.warn('scamHashes.json 저장 실패', { error: e.message });
   }

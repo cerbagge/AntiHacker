@@ -26,8 +26,10 @@ function isPdfAttachment(att) {
 }
 
 /**
+ * 텍스트·링크는 페이지별로 나눈다 — 문서 전체 텍스트를 모든 페이지에 붙이면 정상 표지가
+ * 뒤 페이지의 스캠 문구로 삭제 판정을 받고 그 표지 해시가 블록리스트에 학습된다.
  * @param {Buffer} buffer PDF 원본
- * @returns {Promise<{pages: Buffer[], text: string}|null>} 페이지 PNG 들 + 텍스트/링크. 실패 시 null
+ * @returns {Promise<Array<{image: Buffer, text: string}>|null>} 페이지별 PNG + 그 페이지 텍스트/링크. 실패 시 null
  */
 async function renderPdf(buffer) {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ahpdf-'));
@@ -44,12 +46,25 @@ async function renderPdf(buffer) {
 
     await run('pdftoppm', ['-png', '-r', String(RENDER_DPI), '-l', last, '-q', file, path.join(dir, 'p')]);
     const names = (await fs.promises.readdir(dir)).filter((n) => n.endsWith('.png')).sort();
-    const pages = await Promise.all(names.map((n) => fs.promises.readFile(path.join(dir, n))));
-    if (pages.length === 0) return null;
+    if (names.length === 0) return null;
 
-    // pdfinfo -url 출력: "Page  Type  URL" 표 — URL 열만 남긴다
-    const linkUrls = urls.split('\n').map((l) => l.trim().split(/\s+/).pop()).filter((u) => /^https?:\/\//i.test(u || ''));
-    return { pages, text: `${text}\n${linkUrls.join('\n')}` };
+    // pdftotext 는 페이지 사이를 \f(form feed)로 구분한다
+    const pageTexts = text.split('\f');
+    // pdfinfo -url 출력: "Page  Type  URL" 표 — 페이지 번호별로 URL 을 모은다
+    const pageUrls = {};
+    for (const line of urls.split('\n')) {
+      const [page, , url] = line.trim().split(/\s+/);
+      if (/^\d+$/.test(page) && /^https?:\/\//i.test(url || '')) (pageUrls[page] = pageUrls[page] || []).push(url);
+    }
+
+    // await 필수 — finally 의 임시 디렉터리 삭제가 파일 읽기보다 먼저 돌지 않게
+    return await Promise.all(names.map(async (n) => {
+      const page = Number(/-(\d+)\.png$/.exec(n)[1]); // pdftoppm 출력: p-1.png / p-01.png
+      return {
+        image: await fs.promises.readFile(path.join(dir, n)),
+        text: `${pageTexts[page - 1] || ''}\n${(pageUrls[page] || []).join('\n')}`,
+      };
+    }));
   } catch (e) {
     logger.warn('PDF 렌더링 실패(스캠 스캔 스킵)', { error: e.message.split('\n')[0] });
     return null;
