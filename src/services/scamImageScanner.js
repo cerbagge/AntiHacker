@@ -16,6 +16,7 @@
 const { createWorker } = require('tesseract.js');
 const Jimp = require('jimp');
 const sharp = require('sharp');
+const heicDecode = require('heic-decode');
 const jsQR = require('jsqr');
 
 const config = require('../config');
@@ -153,6 +154,62 @@ function evaluateUrls(rawText, qrUrl, lang) {
   return { hit: false, ext, reason: null };
 }
 
+// contentType 이 비었거나 image/* 가 아니어도 확장자가 이미지면 스캔 대상 (heic/jfif 등)
+const IMAGE_EXTS = new Set([
+  'jpg', 'jpeg', 'jfif', 'pjpeg', 'pjp', 'png', 'apng', 'gif', 'webp', 'avif',
+  'heic', 'heif', 'bmp', 'tif', 'tiff', 'svg',
+]);
+
+function isImageAttachment(att) {
+  if (att.contentType && att.contentType.startsWith('image/')) return true;
+  const m = /\.([a-z0-9]+)$/i.exec(att.name || '');
+  return Boolean(m && IMAGE_EXTS.has(m[1].toLowerCase()));
+}
+
+/**
+ * Jimp 0.x 가 못 읽는 포맷을 PNG 로 변환. sharp: webp/avif/svg/tiff 등,
+ * heic-decode: 아이폰 HEIC(prebuilt sharp 는 HEVC 미지원). 움직이는 이미지는 첫 프레임. 실패 시 null
+ */
+async function convertToPng(buffer) {
+  try {
+    return await sharp(buffer).png().toBuffer();
+  } catch { /* 다음 디코더 */ }
+  try {
+    const { width, height, data } = await heicDecode({ buffer });
+    return await sharp(Buffer.from(data), { raw: { width, height, channels: 4 } }).png().toBuffer();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 움직이는 이미지(gif/webp 등)는 디코더가 첫 프레임만 읽는다 → 스캠 문구가 뒤 프레임에만
+ * 있으면 놓친다. 처음·중간·마지막 프레임을 세로로 이어붙인 PNG 한 장으로 바꿔 OCR 1회로 본다.
+ * 정지 이미지이거나 실패하면 원본 그대로.
+ */
+async function stackFrames(buffer) {
+  try {
+    const { pages } = await sharp(buffer).metadata();
+    if (!pages || pages < 2) return buffer;
+    const picks = [...new Set([0, Math.floor((pages - 1) / 2), pages - 1])];
+    const frames = await Promise.all(picks.map(async (page) => {
+      const { data, info } = await sharp(buffer, { page }).png().toBuffer({ resolveWithObject: true });
+      return { data, info };
+    }));
+    const width = Math.max(...frames.map((f) => f.info.width));
+    let top = 0;
+    const layers = frames.map((f) => {
+      const layer = { input: f.data, top, left: 0 };
+      top += f.info.height;
+      return layer;
+    });
+    return await sharp({ create: { width, height: top, channels: 4, background: '#ffffff' } })
+      .composite(layers).png().toBuffer();
+  } catch {
+    return buffer;
+  }
+}
+
 /** fetch 로 첨부 다운로드 (크기 제한). 실패 시 null */
 async function downloadAttachment(url) {
   try {
@@ -187,14 +244,18 @@ async function scanImage(buffer, mimeType, messageText, lang = DEFAULT_LANG) {
     source: 'local',
   };
 
+  buffer = await stackFrames(buffer);
+
   let image;
   try {
     image = await Jimp.read(buffer);
   } catch {
-    // Jimp 0.x 가 못 읽는 포맷(webp/avif 등) → sharp 로 PNG 변환 후 재시도.
-    // 움직이는 이미지는 첫 프레임. 변환된 PNG는 VLM에도 그대로 쓴다.
+    // Jimp 0.x 가 못 읽는 포맷(webp/avif/heic/svg 등) → PNG 변환 후 재시도.
+    // 변환된 PNG는 VLM에도 그대로 쓴다.
     try {
-      buffer = await sharp(buffer).png().toBuffer();
+      const png = await convertToPng(buffer);
+      if (!png) throw new Error('지원하지 않는 이미지 형식');
+      buffer = png;
       image = await Jimp.read(buffer);
     } catch (e) {
       // 디코드 불가(실제 이미지 아님 등) → 스캠 아님으로 통과
@@ -429,4 +490,4 @@ async function shutdown() {
   }
 }
 
-module.exports = { scanImage, scanMessageImages, downloadAttachment, shutdown };
+module.exports = { scanImage, scanMessageImages, downloadAttachment, isImageAttachment, shutdown };
