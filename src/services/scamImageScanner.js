@@ -15,6 +15,7 @@
  */
 const { createWorker } = require('tesseract.js');
 const Jimp = require('jimp');
+const sharp = require('sharp');
 const jsQR = require('jsqr');
 
 const config = require('../config');
@@ -189,10 +190,17 @@ async function scanImage(buffer, mimeType, messageText, lang = DEFAULT_LANG) {
   let image;
   try {
     image = await Jimp.read(buffer);
-  } catch (e) {
-    // 디코드 불가(실제 이미지 아님 등) → 스캠 아님으로 통과
-    logger.warn('이미지 디코드 실패(스캠 스캔 스킵)', { error: e.message });
-    return base;
+  } catch {
+    // Jimp 0.x 가 못 읽는 포맷(webp/avif 등) → sharp 로 PNG 변환 후 재시도.
+    // 움직이는 이미지는 첫 프레임. 변환된 PNG는 VLM에도 그대로 쓴다.
+    try {
+      buffer = await sharp(buffer).png().toBuffer();
+      image = await Jimp.read(buffer);
+    } catch (e) {
+      // 디코드 불가(실제 이미지 아님 등) → 스캠 아님으로 통과
+      logger.warn('이미지 디코드 실패(스캠 스캔 스킵)', { error: e.message });
+      return base;
+    }
   }
 
   // 1) 이미지 해시 — 알려진 스캠과 일치하면 즉시 차단
