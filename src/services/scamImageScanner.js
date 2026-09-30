@@ -25,6 +25,7 @@ const patterns = require('../constants/cryptoScamPatterns');
 const linkScanner = require('./linkScanner');
 const scamHashStore = require('./scamHashStore');
 const localVlmService = require('./localVlmService');
+const pdfRenderer = require('./pdfRenderer');
 const { t, DEFAULT_LANG } = require('./i18n');
 
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024; // 20MB 초과는 스킵
@@ -162,6 +163,7 @@ const IMAGE_EXTS = new Set([
 
 function isImageAttachment(att) {
   if (att.contentType && att.contentType.startsWith('image/')) return true;
+  if (pdfRenderer.isPdfAttachment(att)) return true; // 페이지를 PNG로 렌더링해 이미지처럼 스캔
   const m = /\.([a-z0-9]+)$/i.exec(att.name || '');
   return Boolean(m && IMAGE_EXTS.has(m[1].toLowerCase()));
 }
@@ -462,18 +464,36 @@ async function scanMessageImages(imageAttachments, messageText, prefetched, lang
       continue;
     }
 
-    const result = await scanImage(buffer, att.contentType, messageText, lang);
-    result.attachmentName = att.name;
-    result.attachmentUrl = att.url;
-    result.buffer = buffer;
-    scanned.push({ url: att.url, buffer, result });
-
-    if (result.autoDelete) {
-      // 삭제 확정 → 메시지 전체를 지우므로 나머지 이미지는 스캔할 필요 없음
-      return { autoDelete: true, suspicious: true, trigger: result, scanned };
+    // PDF → 앞 페이지 PNG 들로 펼쳐 각각 이미지처럼 스캔 (텍스트 레이어·링크는 동봉 텍스트로)
+    let targets = [{ buffer, name: att.name, mime: att.contentType, text: messageText }];
+    if (pdfRenderer.isPdfAttachment(att)) {
+      const pdf = await pdfRenderer.renderPdf(buffer);
+      if (!pdf) {
+        scanned.push({ url: att.url, buffer: null, result: null });
+        continue;
+      }
+      targets = pdf.pages.map((page, i) => ({
+        buffer: page,
+        name: `${att.name}_p${i + 1}.png`,
+        mime: 'image/png',
+        text: `${messageText || ''}\n${pdf.text}`,
+      }));
     }
-    if (result.suspicious && (!topSuspicious || result.dangerPercent > topSuspicious.dangerPercent)) {
-      topSuspicious = result;
+
+    for (const target of targets) {
+      const result = await scanImage(target.buffer, target.mime, target.text, lang);
+      result.attachmentName = target.name;
+      result.attachmentUrl = att.url;
+      result.buffer = target.buffer;
+      scanned.push({ url: att.url, buffer: target.buffer, result });
+
+      if (result.autoDelete) {
+        // 삭제 확정 → 메시지 전체를 지우므로 나머지 이미지는 스캔할 필요 없음
+        return { autoDelete: true, suspicious: true, trigger: result, scanned };
+      }
+      if (result.suspicious && (!topSuspicious || result.dangerPercent > topSuspicious.dangerPercent)) {
+        topSuspicious = result;
+      }
     }
   }
 
