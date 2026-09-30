@@ -23,8 +23,8 @@ module.exports = Object.freeze({
   SCAM_VLM_ENABLED: process.env.SCAM_VLM_ENABLED !== 'false',
   // 로컬 VLM(Ollama) 설정
   OLLAMA_URL: process.env.OLLAMA_URL || 'http://127.0.0.1:11434',
-  OLLAMA_VLM_MODEL: process.env.OLLAMA_VLM_MODEL || 'qwen2.5vl:3b',
-  OLLAMA_TIMEOUT_MS: parseInt(process.env.OLLAMA_TIMEOUT_MS, 10) || 90000,
+  OLLAMA_VLM_MODEL: process.env.OLLAMA_VLM_MODEL || 'qwen2.5vl:7b',
+  OLLAMA_TIMEOUT_MS: parseInt(process.env.OLLAMA_TIMEOUT_MS, 10) || 180000,
 
   // ── 첨부 바이러스 검사 (ClamAV, 로컬 clamd 데몬) ──
   // AI가 아니라 시그니처 기반이라 가벼움 → RAM 업그레이드와 무관하게 동작. ClamAV 없으면 자동 스킵.

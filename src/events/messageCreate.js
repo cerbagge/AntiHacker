@@ -86,9 +86,7 @@ module.exports = (client) => {
         // ── 로컬 코인 스캠 이미지 감지 (완전 로컬) ──
         // 마스터 스위치 ON + 길드 메시지일 때만. 고신뢰 → 즉시 삭제. 임계값 미만 의심 → 알림만.
         if (config.SCAM_IMAGE_GUARD_ENABLED && message.guild) {
-          const scamImages = allAttachments.filter(
-            (a) => a.contentType && a.contentType.startsWith('image/')
-          );
+          const scamImages = allAttachments.filter(scamImageScanner.isImageAttachment);
           if (scamImages.length > 0) {
             const scamResult = await scamImageScanner.scanMessageImages(scamImages, allContent, attachmentBuffers, lang);
             if (scamResult.autoDelete) {

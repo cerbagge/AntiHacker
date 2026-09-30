@@ -10,9 +10,13 @@
  *
  * 결과의 dangerPercent / 임계값으로 자동삭제 여부를 정한다. 오삭제를 막기 위해
  * 자동삭제는 "점수 임계값 이상 + 서로 다른 신호 2종류 이상"을 모두 만족해야 한다.
+ * VLM은 로컬이 이미 의심한 건을 확정으로 올릴 수만 있고, 로컬 근거 없이 단독으로
+ * 삭제를 만들지 못한다 (AI 단독 판정 = 의심 → 관리자 알림만).
  */
 const { createWorker } = require('tesseract.js');
 const Jimp = require('jimp');
+const sharp = require('sharp');
+const heicDecode = require('heic-decode');
 const jsQR = require('jsqr');
 
 const config = require('../config');
@@ -21,6 +25,7 @@ const patterns = require('../constants/cryptoScamPatterns');
 const linkScanner = require('./linkScanner');
 const scamHashStore = require('./scamHashStore');
 const localVlmService = require('./localVlmService');
+const pdfRenderer = require('./pdfRenderer');
 const { t, DEFAULT_LANG } = require('./i18n');
 
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024; // 20MB 초과는 스킵
@@ -105,6 +110,39 @@ const MONEY = /(\$\s?\d[\d.,]*)|(\b\d[\d.,]*\s?(usdt|usdc|btc|eth|trx|usd|dollar
 // OCR 텍스트엔 http:// 없는 맨 도메인(hexowin.net, hexowin149.pro 등)이 흔하다 → 따로 추출
 const BARE_DOMAIN = /\b((?:[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?\.)+(?:com|net|org|io|pro|xyz|app|site|live|vip|win|club|info|biz|online|fund|gift|cash|top|cc|gg))(\/[^\s]*)?/gi;
 
+/**
+ * {en, ko} 그룹에서 겹치지 않는 매칭이 몇 개인지. 긴 토큰부터 매칭하고 매칭된 구간을 지워서
+ * "실현손익"⊃"손익", "unrealized pnl"⊃"pnl" 처럼 한 단어가 두 번 세어지지 않게 한다.
+ */
+function countGroup(textLower, group) {
+  const tokens = [
+    ...(group.ko || []).map((t) => ({ t: t.toLowerCase(), en: false })),
+    ...(group.en || []).map((t) => ({ t: t.toLowerCase(), en: true })),
+  ].sort((a, b) => b.t.length - a.t.length);
+
+  let text = textLower;
+  let n = 0;
+  for (const { t, en } of tokens) {
+    const re = en
+      ? new RegExp(`(?<![a-z0-9])${escapeRegExp(t)}(?![a-z0-9])`, 'i')
+      : new RegExp(escapeRegExp(t));
+    const m = re.exec(text);
+    if (!m) continue;
+    n++;
+    text = `${text.slice(0, m.index)}${' '.repeat(m[0].length)}${text.slice(m.index + m[0].length)}`;
+  }
+  return n;
+}
+
+function isExchangeDomain(url) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return patterns.exchangeDomains.some((d) => host === d || host.endsWith(`.${d}`));
+  } catch {
+    return false;
+  }
+}
+
 /** OCR 텍스트/QR/동봉 텍스트로부터 URL 신호 평가. hit=강신호(힌트/피싱패턴), ext=비안전 외부도메인 존재(약신호) */
 function evaluateUrls(rawText, qrUrl, lang) {
   const urls = linkScanner.extractUrls(rawText);
@@ -114,7 +152,7 @@ function evaluateUrls(rawText, qrUrl, lang) {
 
   let ext = false;
   for (const url of all) {
-    if (linkScanner.isSafeDomain(url)) continue;
+    if (linkScanner.isSafeDomain(url) || isExchangeDomain(url)) continue;
 
     const local = linkScanner.checkLocalPatterns(url, lang);
     if (local) return { hit: true, ext: true, reason: `${local.reason} (\`${url}\`)` };
@@ -126,6 +164,63 @@ function evaluateUrls(rawText, qrUrl, lang) {
     ext = true; // 비안전 외부 도메인 존재 (약한 신호)
   }
   return { hit: false, ext, reason: null };
+}
+
+// contentType 이 비었거나 image/* 가 아니어도 확장자가 이미지면 스캔 대상 (heic/jfif 등)
+const IMAGE_EXTS = new Set([
+  'jpg', 'jpeg', 'jfif', 'pjpeg', 'pjp', 'png', 'apng', 'gif', 'webp', 'avif',
+  'heic', 'heif', 'bmp', 'tif', 'tiff', 'svg',
+]);
+
+function isImageAttachment(att) {
+  if (att.contentType && att.contentType.startsWith('image/')) return true;
+  if (pdfRenderer.isPdfAttachment(att)) return true; // 페이지를 PNG로 렌더링해 이미지처럼 스캔
+  const m = /\.([a-z0-9]+)$/i.exec(att.name || '');
+  return Boolean(m && IMAGE_EXTS.has(m[1].toLowerCase()));
+}
+
+/**
+ * Jimp 0.x 가 못 읽는 포맷을 PNG 로 변환. sharp: webp/avif/svg/tiff 등,
+ * heic-decode: 아이폰 HEIC(prebuilt sharp 는 HEVC 미지원). 움직이는 이미지는 첫 프레임. 실패 시 null
+ */
+async function convertToPng(buffer) {
+  try {
+    return await sharp(buffer).png().toBuffer();
+  } catch { /* 다음 디코더 */ }
+  try {
+    const { width, height, data } = await heicDecode({ buffer });
+    return await sharp(Buffer.from(data), { raw: { width, height, channels: 4 } }).png().toBuffer();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 움직이는 이미지(gif/webp 등)는 디코더가 첫 프레임만 읽는다 → 스캠 문구가 뒤 프레임에만
+ * 있으면 놓친다. 처음·중간·마지막 프레임을 세로로 이어붙인 PNG 한 장으로 바꿔 OCR 1회로 본다.
+ * 정지 이미지이거나 실패하면 원본 그대로.
+ */
+async function stackFrames(buffer) {
+  try {
+    const { pages } = await sharp(buffer).metadata();
+    if (!pages || pages < 2) return buffer;
+    const picks = [...new Set([0, Math.floor((pages - 1) / 2), pages - 1])];
+    const frames = await Promise.all(picks.map(async (page) => {
+      const { data, info } = await sharp(buffer, { page }).png().toBuffer({ resolveWithObject: true });
+      return { data, info };
+    }));
+    const width = Math.max(...frames.map((f) => f.info.width));
+    let top = 0;
+    const layers = frames.map((f) => {
+      const layer = { input: f.data, top, left: 0 };
+      top += f.info.height;
+      return layer;
+    });
+    return await sharp({ create: { width, height: top, channels: 4, background: '#ffffff' } })
+      .composite(layers).png().toBuffer();
+  } catch {
+    return buffer;
+  }
 }
 
 /** fetch 로 첨부 다운로드 (크기 제한). 실패 시 null */
@@ -162,13 +257,24 @@ async function scanImage(buffer, mimeType, messageText, lang = DEFAULT_LANG) {
     source: 'local',
   };
 
+  buffer = await stackFrames(buffer);
+
   let image;
   try {
     image = await Jimp.read(buffer);
-  } catch (e) {
-    // 디코드 불가(실제 이미지 아님 등) → 스캠 아님으로 통과
-    logger.warn('이미지 디코드 실패(스캠 스캔 스킵)', { error: e.message });
-    return base;
+  } catch {
+    // Jimp 0.x 가 못 읽는 포맷(webp/avif/heic/svg 등) → PNG 변환 후 재시도.
+    // 변환된 PNG는 VLM에도 그대로 쓴다.
+    try {
+      const png = await convertToPng(buffer);
+      if (!png) throw new Error('지원하지 않는 이미지 형식');
+      buffer = png;
+      image = await Jimp.read(buffer);
+    } catch (e) {
+      // 디코드 불가(실제 이미지 아님 등) → 스캠 아님으로 통과
+      logger.warn('이미지 디코드 실패(스캠 스캔 스킵)', { error: e.message });
+      return base;
+    }
   }
 
   // 1) 이미지 해시 — 알려진 스캠과 일치하면 즉시 차단
@@ -227,12 +333,17 @@ async function scanImage(buffer, mimeType, messageText, lang = DEFAULT_LANG) {
   const tags = {};
   const reasons = [];
 
+  // 정상 거래소 거래 화면(포지션/체결/손익 UI) — 여기선 "10x"·"2배"가 레버리지다.
+  const trading = countGroup(textLower, patterns.tradingContext) >= 2;
+
   const gv = matchGroup(textLower, patterns.giveawayActions);
   if (gv) { tags.giveaway = true; reasons.push(t(lang, 'reason.giveaway', { token: gv })); }
   if (SEND_RECEIVE_EN.test(rawText) || SEND_RECEIVE_KO.test(rawText)) {
     tags.giveaway = true; reasons.push(t(lang, 'reason.sendReceive'));
   }
-  if (MULTIPLIER.test(rawText)) { tags.giveaway = true; reasons.push(t(lang, 'reason.multiplier')); }
+  if (!trading && (MULTIPLIER.test(rawText) || matchGroup(textLower, patterns.multiplierWords))) {
+    tags.giveaway = true; reasons.push(t(lang, 'reason.multiplier'));
+  }
 
   const wl = matchGroup(textLower, patterns.walletActions);
   if (wl) { tags.wallet = true; reasons.push(t(lang, 'reason.wallet', { token: wl })); }
@@ -279,14 +390,20 @@ async function scanImage(buffer, mimeType, messageText, lang = DEFAULT_LANG) {
     || (tags.casino && tags.crypto && tags.money)
     || (tags.casino && tags.proof)
   );
-  let autoDelete = Boolean(
+  let localAutoDelete = Boolean(
     (score >= autoThreshold && tagCount >= 2)
     || (decisiveCombo && score >= SUSPICIOUS_THRESHOLD)
   );
+  // 거래 화면 화이트리스트: 스캠 행동 신호(에어드랍·지갑·스캠URL·카지노)가 없으면
+  // 삭제·제재하지 않고 최대 의심(관리자 알림)까지만. Tesla 같은 종목명은 celebrity로 잡혀도 무시.
+  const tradingWhitelisted = trading && !(tags.giveaway || tags.wallet || tags.url || tags.casino);
+  if (tradingWhitelisted) localAutoDelete = false;
+  let autoDelete = localAutoDelete;
   let suspicious = score >= SUSPICIOUS_THRESHOLD;
   const signals = [...Object.keys(tags)];
+  if (tradingWhitelisted) signals.push('trading-whitelist');
 
-  // 5) 로컬 VLM 보강 — 자동삭제는 아니지만 스캠 신호 조합이 있으면 VLM이 눈으로 최종 판정.
+  // 5) 로컬 VLM 보강 — 자동삭제는 아니지만 스캠 신호 조합이 있으면 VLM이 눈으로 재확인.
   //    (순수 양성 이미지 = 신호 0개는 VLM을 부르지 않아 CPU 비용을 묶어둔다.)
   const strongTag = tags.giveaway || tags.wallet || tags.url || tags.casino || tags.celebrity;
   const lowTextHint = ocrText.trim().length < 40 && (tags.crypto || tags.qr);
@@ -298,24 +415,32 @@ async function scanImage(buffer, mimeType, messageText, lang = DEFAULT_LANG) {
     || lowTextHint
   );
 
+  // VLM은 "의심을 확정으로 올리는" 역할만 한다 — 없던 판정을 혼자 만들지 못한다.
+  // 로컬이 스스로 의심(점수 45+)으로 보고, 서로 다른 신호가 2종류 이상일 때만 VLM 확정을 인정.
+  // (오탐 사례: 카지노 삭제 공지 스크린샷 → 로컬은 "카지노" 한 단어 30점뿐인데
+  //  3B VLM이 없는 유명인 사칭을 봤다며 0.95로 단정 → 삭제 + 자동 킥)
+  const localCorroborated = tagCount >= 2 && score >= SUSPICIOUS_THRESHOLD;
+
   if (candidate) {
     const vlm = await localVlmService.analyzeImage(buffer);
     if (vlm) {
       signals.push(`vlm(scam=${vlm.scam},conf=${vlm.confidence.toFixed(2)})`);
-      if (vlm.scam && vlm.confidence >= 0.8) {
+      if (vlm.scam && vlm.confidence >= 0.8 && localCorroborated && !tradingWhitelisted) {
         autoDelete = true;
         suspicious = true;
         score = Math.max(score, 90);
         reasons.push(t(lang, 'reason.vlmScam', { pct: Math.round(vlm.confidence * 100), detail: vlm.reason }));
       } else if (vlm.scam && vlm.confidence >= 0.5) {
+        // 로컬 뒷받침이 없는 AI 단독 판정 → 삭제·제재 없이 관리자 알림만(의심)
         suspicious = true;
         reasons.push(t(lang, 'reason.vlmSuspect', { pct: Math.round(vlm.confidence * 100), detail: vlm.reason }));
       }
     }
   }
 
-  // 고신뢰 자동삭제로 확정되면 → 해시 블록리스트에 등록(이후 동일 이미지 즉시 차단)
-  if (autoDelete && imgHash && !known) {
+  // 해시 블록리스트는 이후 OCR/AI 없이 100%로 즉시 삭제하는 fast-path라 오탐이 영구히 굳는다.
+  // → AI가 개입하지 않은 로컬 확정 삭제만 학습한다.
+  if (localAutoDelete && imgHash && !known) {
     scamHashStore.addScamHash(imgHash);
   }
 
@@ -350,18 +475,36 @@ async function scanMessageImages(imageAttachments, messageText, prefetched, lang
       continue;
     }
 
-    const result = await scanImage(buffer, att.contentType, messageText, lang);
-    result.attachmentName = att.name;
-    result.attachmentUrl = att.url;
-    result.buffer = buffer;
-    scanned.push({ url: att.url, buffer, result });
-
-    if (result.autoDelete) {
-      // 삭제 확정 → 메시지 전체를 지우므로 나머지 이미지는 스캔할 필요 없음
-      return { autoDelete: true, suspicious: true, trigger: result, scanned };
+    // PDF → 앞 페이지 PNG 들로 펼쳐 각각 이미지처럼 스캔 (그 페이지의 텍스트·링크만 동봉 텍스트로)
+    let targets = [{ buffer, name: att.name, mime: att.contentType, text: messageText }];
+    if (pdfRenderer.isPdfAttachment(att)) {
+      const pages = await pdfRenderer.renderPdf(buffer);
+      if (!pages) {
+        scanned.push({ url: att.url, buffer: null, result: null });
+        continue;
+      }
+      targets = pages.map((page, i) => ({
+        buffer: page.image,
+        name: `${att.name}_p${i + 1}.png`,
+        mime: 'image/png',
+        text: `${messageText || ''}\n${page.text}`,
+      }));
     }
-    if (result.suspicious && (!topSuspicious || result.dangerPercent > topSuspicious.dangerPercent)) {
-      topSuspicious = result;
+
+    for (const target of targets) {
+      const result = await scanImage(target.buffer, target.mime, target.text, lang);
+      result.attachmentName = target.name;
+      result.attachmentUrl = att.url;
+      result.buffer = target.buffer;
+      scanned.push({ url: att.url, buffer: target.buffer, result });
+
+      if (result.autoDelete) {
+        // 삭제 확정 → 메시지 전체를 지우므로 나머지 이미지는 스캔할 필요 없음
+        return { autoDelete: true, suspicious: true, trigger: result, scanned };
+      }
+      if (result.suspicious && (!topSuspicious || result.dangerPercent > topSuspicious.dangerPercent)) {
+        topSuspicious = result;
+      }
     }
   }
 
@@ -378,4 +521,4 @@ async function shutdown() {
   }
 }
 
-module.exports = { scanImage, scanMessageImages, downloadAttachment, shutdown };
+module.exports = { scanImage, scanMessageImages, downloadAttachment, isImageAttachment, shutdown };

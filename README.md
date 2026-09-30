@@ -7,22 +7,24 @@ Discord 코인 스캠/스팸 이미지·초대 링크를 **온디바이스(로�
 
 | 단계 | 도구 | 용도 |
 |------|------|------|
-| 비전 판정(VLM) | **Ollama + Qwen2.5-VL 3B** (`qwen2.5vl:3b`) | OCR·패턴 점수가 애매할 때 이미지를 눈으로 보고 스캠 여부 최종 판정 |
+| 비전 판정(VLM) | **Ollama + Qwen2.5-VL 7B** (`qwen2.5vl:7b`) | OCR·패턴 점수가 애매할 때 이미지를 눈으로 보고 스캠 여부 최종 판정 |
 | 문자 인식(OCR) | **Tesseract.js** (한국어+영어, `kor+eng`) | 이미지 속 글자 추출 (traineddata 동봉) |
 | 바이러스 검사 | **ClamAV** (`clamdscan` 데몬) | 모든 첨부를 시그니처 기반으로 검사, 감염 시 삭제 |
+| PDF 렌더링 | **Poppler** (`poppler-utils`) | PDF 앞 3페이지를 이미지로 바꿔 스캠 검사, 텍스트·숨은 링크 추출 |
 
 탐지 파이프라인(싼 것 → 비싼 것): **이미지 해시(dHash) → QR 해독 → OCR → 패턴 점수 → 로컬 VLM**.
 점수 임계값 이상 + 서로 다른 신호 2종류 이상일 때만 자동 삭제해 오삭제를 막습니다.
 
-> 세 가지 로컬 도구는 모두 **선택**입니다. Ollama/ClamAV가 없으면 그 단계는 조용히 스킵되고,
+> 로컬 도구는 모두 **선택**입니다. Ollama/ClamAV/Poppler가 없으면 그 단계는 조용히 스킵되고,
 > 해시·OCR·패턴 점수만으로도 동작합니다. VLM은 CPU 추론이라 느리므로 애매한 이미지에만 호출됩니다.
 
 ## 요구 사항
 
-- **Node.js 18 이상** (전역 `fetch` / `AbortSignal.timeout` 사용)
+- **Node.js 20.9 이상** (이미지 변환용 `sharp` 요구사항)
 - Discord 봇 토큰
 - (선택) **Ollama** — 이미지 비전 판정을 쓰려면
 - (선택) **ClamAV** — 첨부 바이러스 검사를 쓰려면
+- (선택) **Poppler** — PDF 첨부 스캠 검사를 쓰려면
 
 ## 설치
 
@@ -34,20 +36,21 @@ cd AntiHacker
 npm install
 ```
 
-### 2) 로컬 AI(VLM) 설치 — Ollama + Qwen2.5-VL 3B  *(선택)*
+### 2) 로컬 AI(VLM) 설치 — Ollama + Qwen2.5-VL 7B  *(선택)*
 
 ```bash
 # Ollama 설치 (Linux/macOS)
 curl -fsSL https://ollama.com/install.sh | sh
 
 # 사용하는 비전 모델 내려받기
-ollama pull qwen2.5vl:3b
+ollama pull qwen2.5vl:7b
 
 # Ollama 데몬이 http://127.0.0.1:11434 에서 떠 있으면 봇이 자동으로 연결
 ```
 
-> 온디바이스 CPU 추론이라 RAM 여유가 필요합니다(32GB 권장). RAM이 부족하면
-> `.env` 에서 `SCAM_VLM_ENABLED=false` 로 끄고 해시/OCR/패턴만 써도 됩니다.
+> 7B 모델은 약 6GB이고, GPU 없는 CPU 추론에서는 이미지당 1.5~2분 걸립니다(i7-8700 실측).
+> 더 가볍게 쓰려면 `ollama pull qwen2.5vl:3b` 후 `.env` 에서 `OLLAMA_VLM_MODEL=qwen2.5vl:3b`,
+> 아예 끄려면 `SCAM_VLM_ENABLED=false` 로 해시/OCR/패턴만 써도 됩니다.
 
 ### 3) 바이러스 검사 설치 — ClamAV  *(선택)*
 
@@ -56,6 +59,16 @@ ollama pull qwen2.5vl:3b
 sudo apt install clamav-daemon
 sudo systemctl enable --now clamav-daemon
 # clamdscan 바이너리가 PATH 에 있으면 봇이 자동 사용 (없으면 스킵)
+```
+
+### 3-1) PDF 검사 설치 — Poppler  *(선택)*
+
+```bash
+# Debian/Ubuntu
+sudo apt install poppler-utils
+# macOS
+brew install poppler
+# pdftoppm / pdftotext / pdfinfo 가 PATH 에 있으면 봇이 자동 사용 (없으면 PDF 스캠 검사 스킵)
 ```
 
 ### 4) 환경 변수 설정
@@ -74,7 +87,8 @@ cp .env.example .env
 | `SCAM_AUTODELETE_THRESHOLD` | `70` | 자동삭제 점수 임계값 |
 | `SCAM_VLM_ENABLED` | `true` | 로컬 VLM(Ollama) 사용 여부 (없으면 자동 스킵) |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama 주소 |
-| `OLLAMA_VLM_MODEL` | `qwen2.5vl:3b` | 사용할 비전 모델 |
+| `OLLAMA_VLM_MODEL` | `qwen2.5vl:7b` | 사용할 비전 모델 |
+| `OLLAMA_TIMEOUT_MS` | `180000` | VLM 응답 대기 한도 (CPU 7B 기준) |
 | `VIRUS_SCAN_ENABLED` | `true` | ClamAV 첨부 검사 사용 여부 |
 
 서버 잠금(허용목록)은 루트의 `allowedGuilds.json` 에 서버 ID를 넣어 설정합니다.

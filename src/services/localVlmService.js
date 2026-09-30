@@ -5,11 +5,31 @@
  * Ollama가 설치/실행되어 있지 않으면 조용히 null 을 반환해서 파이프라인이 그대로 진행된다.
  * (CPU 추론이라 느리므로 타임아웃을 넉넉히 둔다.)
  *
- * 사용 모델 기본값: qwen2.5vl:3b  (config.OLLAMA_VLM_MODEL 로 변경)
- *   설치 후:  ollama pull qwen2.5vl:3b
+ * 사용 모델 기본값: qwen2.5vl:7b  (config.OLLAMA_VLM_MODEL 로 변경)
+ *   설치 후:  ollama pull qwen2.5vl:7b
  */
+const Jimp = require('jimp');
 const config = require('../config');
 const logger = require('../utils/logger');
+
+// qwen2.5vl 은 이미지 해상도에 비례해 토큰을 쓴다 (28x28px ≈ 1토큰).
+// 카메라 원본(4000x3000)은 컨텍스트 4096을 넘겨 Ollama가 400을 내고, 폰 스크린샷
+// (1080x2400)도 CPU에서 200초가 걸린다 → 긴 변을 줄여서 보낸다.
+const VLM_MAX_SIDE = 1024;
+
+/** 긴 변이 VLM_MAX_SIDE 를 넘으면 줄여서 JPEG로 재인코딩. 디코드 실패 시 원본 그대로 */
+async function shrinkForVlm(buffer) {
+  try {
+    const img = await Jimp.read(buffer);
+    const { width, height } = img.bitmap;
+    if (Math.max(width, height) <= VLM_MAX_SIDE) return buffer;
+    if (width >= height) img.resize(VLM_MAX_SIDE, Jimp.AUTO);
+    else img.resize(Jimp.AUTO, VLM_MAX_SIDE);
+    return await img.quality(90).getBufferAsync(Jimp.MIME_JPEG);
+  } catch {
+    return buffer;
+  }
+}
 
 const PROMPT = [
   'You are a strict Discord content-moderation classifier.',
@@ -227,7 +247,7 @@ async function analyzeImage(buffer) {
       body: JSON.stringify({
         model: config.OLLAMA_VLM_MODEL,
         prompt: PROMPT,
-        images: [buffer.toString('base64')],
+        images: [(await shrinkForVlm(buffer)).toString('base64')],
         stream: false,
         format: 'json',
         options: { temperature: 0 },
