@@ -19,10 +19,38 @@ module.exports = {
     ],
     ko: [
       '에어드랍', '에어드롭', '무료 코인', '코인 무료', '무료 지급', '지급 이벤트',
-      '이벤트 지급', '코인 지급', '두배', '2배', '입금하면', '받으세요', '선착순',
+      '이벤트 지급', '코인 지급', '입금하면', '받으세요', '선착순',
       '무료 비트코인', '코인 받기', '코인 증정', '보상 지급', '무료 채굴',
     ],
   },
+
+  // 배수 보상 단어 — MULTIPLIER 정규식(x2/10x)과 같은 취급. 거래 화면에선 레버리지라 무시한다.
+  multiplierWords: { ko: ['두배', '2배'] },
+
+  // 정상 거래소 거래 화면(화이트리스트) — 서로 다른 토큰 2개 이상이면 거래 화면으로 본다.
+  // 선물/현물 체결·포지션·손익 UI에만 나오는 용어로 한정 (buy/sell/long 처럼 광고에도 흔한 단어 제외).
+  tradingContext: {
+    en: [
+      'leverage', 'futures', 'perp', 'perpetual', 'position', 'positions', 'entry price',
+      'mark price', 'liq. price', 'liq price', 'liquidation price', 'unrealized pnl',
+      'realized pnl', 'pnl', 'roe', 'margin ratio', 'isolated', 'cross', 'order book',
+      'open orders', 'order history', 'trade history', 'avg price', 'avg. price',
+      'limit order', 'market order', 'take profit', 'stop loss', 'tp/sl', 'filled',
+    ],
+    ko: [
+      '레버리지', '포지션', '선물', '진입가', '평균단가', '평단', '청산가', '미실현',
+      '실현손익', '수익률', '손익', '증거금', '교차', '격리', '호가', '체결', '미체결',
+      '매수', '매도', '지정가', '시장가', '주문내역', '거래내역',
+    ],
+  },
+
+  // 정품 거래소 도메인 — 거래 공유카드의 QR(추천 링크)이 스캠 URL 힌트로 잡히지 않게 한다.
+  // 호스트가 정확히 일치하거나 하위 도메인일 때만 (bitget-reward.com 같은 사칭 도메인은 해당 없음)
+  exchangeDomains: [
+    'bitget.com', 'binance.com', 'bybit.com', 'okx.com', 'upbit.com', 'bithumb.com',
+    'coinone.co.kr', 'korbit.co.kr', 'gopax.co.kr', 'mexc.com', 'gate.io', 'kucoin.com',
+    'htx.com', 'bingx.com', 'coinbase.com', 'kraken.com', 'tradingview.com',
+  ],
 
   // 코인 카지노/도박 보너스 스캠 (사칭 + 가짜 출금 인증 장르 — 강한 신호)
   casinoBonus: {

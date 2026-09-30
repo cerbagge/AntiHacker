@@ -107,6 +107,28 @@ const MONEY = /(\$\s?\d[\d.,]*)|(\b\d[\d.,]*\s?(usdt|usdc|btc|eth|trx|usd|dollar
 // OCR 텍스트엔 http:// 없는 맨 도메인(hexowin.net, hexowin149.pro 등)이 흔하다 → 따로 추출
 const BARE_DOMAIN = /\b((?:[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?\.)+(?:com|net|org|io|pro|xyz|app|site|live|vip|win|club|info|biz|online|fund|gift|cash|top|cc|gg))(\/[^\s]*)?/gi;
 
+/** {en, ko} 그룹에서 서로 다른 토큰이 몇 개 매칭되는지 */
+function countGroup(textLower, group) {
+  let n = 0;
+  for (const ko of group.ko || []) {
+    if (ko && textLower.includes(ko.toLowerCase())) n++;
+  }
+  for (const en of group.en || []) {
+    const re = new RegExp(`(^|[^a-z0-9])${escapeRegExp(en.toLowerCase())}([^a-z0-9]|$)`, 'i');
+    if (re.test(textLower)) n++;
+  }
+  return n;
+}
+
+function isExchangeDomain(url) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return patterns.exchangeDomains.some((d) => host === d || host.endsWith(`.${d}`));
+  } catch {
+    return false;
+  }
+}
+
 /** OCR 텍스트/QR/동봉 텍스트로부터 URL 신호 평가. hit=강신호(힌트/피싱패턴), ext=비안전 외부도메인 존재(약신호) */
 function evaluateUrls(rawText, qrUrl, lang) {
   const urls = linkScanner.extractUrls(rawText);
@@ -116,7 +138,7 @@ function evaluateUrls(rawText, qrUrl, lang) {
 
   let ext = false;
   for (const url of all) {
-    if (linkScanner.isSafeDomain(url)) continue;
+    if (linkScanner.isSafeDomain(url) || isExchangeDomain(url)) continue;
 
     const local = linkScanner.checkLocalPatterns(url, lang);
     if (local) return { hit: true, ext: true, reason: `${local.reason} (\`${url}\`)` };
@@ -229,12 +251,17 @@ async function scanImage(buffer, mimeType, messageText, lang = DEFAULT_LANG) {
   const tags = {};
   const reasons = [];
 
+  // 정상 거래소 거래 화면(포지션/체결/손익 UI) — 여기선 "10x"·"2배"가 레버리지다.
+  const trading = countGroup(textLower, patterns.tradingContext) >= 2;
+
   const gv = matchGroup(textLower, patterns.giveawayActions);
   if (gv) { tags.giveaway = true; reasons.push(t(lang, 'reason.giveaway', { token: gv })); }
   if (SEND_RECEIVE_EN.test(rawText) || SEND_RECEIVE_KO.test(rawText)) {
     tags.giveaway = true; reasons.push(t(lang, 'reason.sendReceive'));
   }
-  if (MULTIPLIER.test(rawText)) { tags.giveaway = true; reasons.push(t(lang, 'reason.multiplier')); }
+  if (!trading && (MULTIPLIER.test(rawText) || matchGroup(textLower, patterns.multiplierWords))) {
+    tags.giveaway = true; reasons.push(t(lang, 'reason.multiplier'));
+  }
 
   const wl = matchGroup(textLower, patterns.walletActions);
   if (wl) { tags.wallet = true; reasons.push(t(lang, 'reason.wallet', { token: wl })); }
@@ -281,13 +308,18 @@ async function scanImage(buffer, mimeType, messageText, lang = DEFAULT_LANG) {
     || (tags.casino && tags.crypto && tags.money)
     || (tags.casino && tags.proof)
   );
-  const localAutoDelete = Boolean(
+  let localAutoDelete = Boolean(
     (score >= autoThreshold && tagCount >= 2)
     || (decisiveCombo && score >= SUSPICIOUS_THRESHOLD)
   );
+  // 거래 화면 화이트리스트: 스캠 행동 신호(에어드랍·지갑·스캠URL·카지노)가 없으면
+  // 삭제·제재하지 않고 최대 의심(관리자 알림)까지만. Tesla 같은 종목명은 celebrity로 잡혀도 무시.
+  const tradingWhitelisted = trading && !(tags.giveaway || tags.wallet || tags.url || tags.casino);
+  if (tradingWhitelisted) localAutoDelete = false;
   let autoDelete = localAutoDelete;
   let suspicious = score >= SUSPICIOUS_THRESHOLD;
   const signals = [...Object.keys(tags)];
+  if (tradingWhitelisted) signals.push('trading-whitelist');
 
   // 5) 로컬 VLM 보강 — 자동삭제는 아니지만 스캠 신호 조합이 있으면 VLM이 눈으로 재확인.
   //    (순수 양성 이미지 = 신호 0개는 VLM을 부르지 않아 CPU 비용을 묶어둔다.)
@@ -311,7 +343,7 @@ async function scanImage(buffer, mimeType, messageText, lang = DEFAULT_LANG) {
     const vlm = await localVlmService.analyzeImage(buffer);
     if (vlm) {
       signals.push(`vlm(scam=${vlm.scam},conf=${vlm.confidence.toFixed(2)})`);
-      if (vlm.scam && vlm.confidence >= 0.8 && localCorroborated) {
+      if (vlm.scam && vlm.confidence >= 0.8 && localCorroborated && !tradingWhitelisted) {
         autoDelete = true;
         suspicious = true;
         score = Math.max(score, 90);
