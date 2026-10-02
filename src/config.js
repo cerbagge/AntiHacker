@@ -52,4 +52,8 @@ module.exports = Object.freeze({
   // ① 초대 대상 서버가 19+(성인)/스팸(공식 nsfwLevel + 로컬 AI + 키워드 폴백)이거나
   // ② 함께 적힌 문구가 스팸/성인 유인(키워드 + 로컬 AI)일 확률이 높을 때만 삭제. 기본 켬.
   INVITE_GUARD_ENABLED: process.env.INVITE_GUARD_ENABLED !== 'false',
+
+  // ── 채팅 모더레이터 (실험 기능) ──
+  // experimentalGuilds.json 에 적힌 서버에서만 동작. 판정·요약에 쓸 Ollama 텍스트 모델.
+  CHAT_MOD_MODEL: process.env.CHAT_MOD_MODEL || 'exaone3.5:7.8b',
 });

@@ -11,6 +11,7 @@ _scamtest.js
 # 런타임 상태/설정 (서버·채널·유저 ID 등 개인정보 포함 → 공개 금지)
 guildConfig.json
 allowedGuilds.json
+experimentalGuilds.json
 optout.json
 tempBans.json
 stats.json

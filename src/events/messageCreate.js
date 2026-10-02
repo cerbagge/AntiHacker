@@ -9,6 +9,7 @@ const inviteScanner = require('../services/inviteScanner');
 const virusScanner = require('../services/virusScanner');
 const guildConfigStore = require('../services/guildConfigStore');
 const imageQueue = require('../services/imageQueue');
+const chatModerator = require('../services/chatModerator');
 const logger = require('../utils/logger');
 
 // antihacker+는 완전 로컬: 모든 위협은 S(스팸/사기) 카테고리로 본다 (Gemini 미사용)
@@ -31,6 +32,10 @@ module.exports = (client) => {
 
     // 학습거부 유저는 수집하지 않음
     if (optoutStore.isOptedOut(message.author.id)) return;
+
+    // ── 채팅 모더레이터 (실험 기능, experimentalGuilds.json 서버만) ──
+    // 최근 6줄 흐름을 로컬 LLM이 판정 → 유해하면 삭제 + 10분 타임아웃. 대기열로 따로 돌아서 아래 검사를 막지 않는다.
+    chatModerator.observe(message);
 
     try {
       // 일반 첨부파일 + 전달(forward) 메시지의 첨부파일을 합침
