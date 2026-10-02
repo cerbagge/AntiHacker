@@ -7,11 +7,13 @@
  *    (처벌이 아니라 안내라서 놓치는 쪽이 더 위험 — 실측에서 "약 다 먹고 끝낼거야"가 0.8로 나옴)
  *  - 그 외 0.7 ≤ conf < 0.9 : 조치 없이 로그에 '의심'으로만 남김
  * 로그 채널에는 원문 대신 LLM 요약 + 참여자 + 처벌 결과만 출력한다. (서버 로그에도 원문을 남기지 않음)
+ * CHAT_MOD_LOG_ONLY=true(관찰 모드)면 삭제·타임아웃·DM 없이 '조치했을 판정'을 로그로만 남긴다.
  *
  * LLM은 CPU에서 메시지당 수 초 걸리므로 한 번에 하나씩 순서대로 처리하고, 밀린 메시지가
  * 너무 많으면 새 메시지 검사는 건너뛴다(fail-open). 메시지 처리 흐름(스캠 검사 등)은 막지 않는다.
  */
 const { EmbedBuilder } = require('discord.js');
+const config = require('../config');
 const logger = require('../utils/logger');
 const experimentalGuildStore = require('./experimentalGuildStore');
 const chatSafetyService = require('./chatSafetyService');
@@ -81,7 +83,8 @@ async function review(message, window) {
   if (!verdict || verdict.category === 'none' || verdict.confidence < ALERT_CONFIDENCE) return;
   if (!experimentalGuildStore.isExperimental(message.guild.id)) return; // 판정하는 사이 빠진 경우
 
-  const act = verdict.confidence >= (verdict.category === 'self_harm' ? ALERT_CONFIDENCE : ACTION_CONFIDENCE);
+  const wouldAct = verdict.confidence >= (verdict.category === 'self_harm' ? ALERT_CONFIDENCE : ACTION_CONFIDENCE);
+  const act = wouldAct && !config.CHAT_MOD_LOG_ONLY;
   const lang = guildConfigStore.getLanguage(message.guild.id);
 
   // 조치를 먼저 끝내고(빠르게) 요약은 그 뒤에 만든다(요약은 CPU에서 10초 이상 걸릴 수 있음).
@@ -90,7 +93,7 @@ async function review(message, window) {
   const hasLogChannel = !!guildConfigStore.getLogChannel(message.guild.id);
   const summary = hasLogChannel ? await chatSafetyService.summarize(lines, verdict.category, lang) : null;
 
-  logger.warn(`[실험] 유해 채팅 ${act ? '조치' : '의심(조치 안 함)'}`, {
+  logger.warn(`[실험] 유해 채팅 ${act ? '조치' : wouldAct ? '감지(관찰 모드)' : '의심(조치 안 함)'}`, {
     guild: message.guild.name,
     channel: message.channel.id,
     author: message.author.tag,
@@ -100,7 +103,7 @@ async function review(message, window) {
   });
 
   if (!hasLogChannel) return;
-  const embed = await buildEmbed(message, window, verdict, actions, summary, lang);
+  const embed = await buildEmbed(message, window, verdict, actions, wouldAct, summary, lang);
   await guildLogger.logToGuild(message.client, message.guild.id, { embeds: [embed] });
 }
 
@@ -139,15 +142,15 @@ async function enforce(message, category, lang) {
   return { del, timeout };
 }
 
-async function buildEmbed(message, window, verdict, actions, summary, lang) {
+async function buildEmbed(message, window, verdict, actions, wouldAct, summary, lang) {
   const counts = new Map();
   for (const w of window) counts.set(w.authorId, (counts.get(w.authorId) || 0) + 1);
   const participants = [...counts].map(([id, n]) => `<@${id}> ×${n}`).join('\n');
 
   const cat = await tl(lang, `chat.cat.${verdict.category}`);
   const embed = new EmbedBuilder()
-    .setTitle(await tl(lang, actions ? 'title.chatAction' : 'title.chatSuspect'))
-    .setColor(actions ? 0xed4245 : 0xfee75c)
+    .setTitle(await tl(lang, actions ? 'title.chatAction' : wouldAct ? 'title.chatLogOnly' : 'title.chatSuspect'))
+    .setColor(actions ? 0xed4245 : wouldAct ? 0xe67e22 : 0xfee75c)
     .setThumbnail(message.author.displayAvatarURL())
     .setDescription(`**${await tl(lang, 'field.summary')}**\n${(summary || (await tl(lang, 'chat.summaryFailed'))).slice(0, 1500)}`)
     .addFields(
@@ -155,19 +158,19 @@ async function buildEmbed(message, window, verdict, actions, summary, lang) {
       { name: await tl(lang, 'field.channel'), value: `<#${message.channel.id}>`, inline: true },
       { name: await tl(lang, 'field.category'), value: await tl(lang, 'chat.confidence', { cat, pct: Math.round(verdict.confidence * 100) }), inline: true },
       { name: await tl(lang, 'field.participants', { n: window.length }), value: participants.slice(0, 1024) },
-      { name: await tl(lang, 'field.action'), value: await describeActions(actions, lang) },
+      { name: await tl(lang, 'field.action'), value: await describeActions(actions, wouldAct, lang) },
     )
     .setTimestamp();
 
   if (actions) await addDeleteFailureNotice(embed, actions.del, lang);
-  if (actions && verdict.category === 'self_harm') {
+  if (wouldAct && verdict.category === 'self_harm') {
     embed.addFields({ name: '​', value: await tl(lang, 'chat.careNeeded') });
   }
   return embed;
 }
 
-async function describeActions(actions, lang) {
-  if (!actions) return tl(lang, 'chat.noAction');
+async function describeActions(actions, wouldAct, lang) {
+  if (!actions) return tl(lang, wouldAct ? 'chat.logOnly' : 'chat.noAction');
   const out = [await tl(lang, actions.del.deleted ? 'chat.deleted' : 'chat.notDeleted')];
   if ('dm' in actions) {
     out.push(await tl(lang, 'chat.noTimeoutSelfHarm'));
