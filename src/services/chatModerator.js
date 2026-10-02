@@ -32,7 +32,7 @@ const REASON = 'antihacker+ 실험 기능: 유해 채팅 자동 조치';
 // 판정할 필요 없는 메시지: 글자가 없거나 ㅋㅋ/ㅠㅠ/문장부호뿐인 것 (문맥 버퍼에는 남긴다)
 const TRIVIAL = /^[\sㅋㅎㅠㅜ.,!?~^…]*$/u;
 
-const buffers = new Map(); // channelId -> [{ authorId, line }]
+const buffers = new Map(); // channelId -> [{ authorId, name, body }]
 let pending = 0;
 let chain = Promise.resolve();
 
@@ -43,13 +43,16 @@ let chain = Promise.resolve();
 function observe(message) {
   if (!message.guild || !experimentalGuildStore.isExperimental(message.guild.id)) return;
 
-  const text = (message.cleanContent || '').replace(/\s+/g, ' ').trim();
+  // 전달(forward)된 메시지는 원문이 messageSnapshots 에 들어 있으므로 캡션과 합쳐서 본다
+  const parts = [message.cleanContent];
+  for (const snap of message.messageSnapshots?.values() || []) parts.push(snap.cleanContent || snap.content);
+  const text = parts.filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
   const body = text || (message.attachments.size > 0 ? '(첨부파일)' : '');
   if (!body) return;
 
   const name = message.member?.displayName || message.author.username;
   const buf = buffers.get(message.channel.id) || [];
-  buf.push({ authorId: message.author.id, line: `${name}: ${body.slice(0, LINE_MAX_CHARS)}` });
+  buf.push({ authorId: message.author.id, name, body });
   if (buf.length > CONTEXT_LINES) buf.shift();
   buffers.set(message.channel.id, buf);
 
@@ -68,16 +71,24 @@ function observe(message) {
 }
 
 async function review(message, window) {
-  const lines = window.map((w) => w.line);
+  // 대기 중에 실험 서버 목록에서 빠졌으면 판정·조치하지 않는다
+  if (!experimentalGuildStore.isExperimental(message.guild.id)) return;
+
+  // 이전 문맥 줄만 짧게 자르고, 판정 대상(마지막 줄)은 전체를 넣는다 — 앞에 무해한 글을 채워 숨기는 우회 방지
+  const lines = window.map((w, i) =>
+    `${w.name}: ${i === window.length - 1 ? w.body : w.body.slice(0, LINE_MAX_CHARS)}`);
   const verdict = await chatSafetyService.judge(lines);
   if (!verdict || verdict.category === 'none' || verdict.confidence < ALERT_CONFIDENCE) return;
+  if (!experimentalGuildStore.isExperimental(message.guild.id)) return; // 판정하는 사이 빠진 경우
 
   const act = verdict.confidence >= (verdict.category === 'self_harm' ? ALERT_CONFIDENCE : ACTION_CONFIDENCE);
   const lang = guildConfigStore.getLanguage(message.guild.id);
 
-  // 조치를 먼저 끝내고(빠르게) 요약은 그 뒤에 만든다(요약은 CPU에서 10초 이상 걸릴 수 있음)
+  // 조치를 먼저 끝내고(빠르게) 요약은 그 뒤에 만든다(요약은 CPU에서 10초 이상 걸릴 수 있음).
+  // 로그 채널이 없으면 요약을 보여줄 곳이 없으므로 만들지 않는다(대기열을 오래 붙잡지 않도록).
   const actions = act ? await enforce(message, verdict.category, lang) : null;
-  const summary = await chatSafetyService.summarize(lines, verdict.category, lang);
+  const hasLogChannel = !!guildConfigStore.getLogChannel(message.guild.id);
+  const summary = hasLogChannel ? await chatSafetyService.summarize(lines, verdict.category, lang) : null;
 
   logger.warn(`[실험] 유해 채팅 ${act ? '조치' : '의심(조치 안 함)'}`, {
     guild: message.guild.name,
@@ -88,6 +99,7 @@ async function review(message, window) {
     deleted: actions?.del.deleted,
   });
 
+  if (!hasLogChannel) return;
   const embed = await buildEmbed(message, window, verdict, actions, summary, lang);
   await guildLogger.logToGuild(message.client, message.guild.id, { embeds: [embed] });
 }
@@ -107,9 +119,14 @@ async function enforce(message, category, lang) {
   }
 
   let timeout;
-  const member = message.member || (await message.guild.members.fetch(message.author.id).catch(() => null));
+  // 캐시된 member 는 이후에 걸린 타임아웃을 모를 수 있어(GuildMembers intent 없음) 새로 받아온다
+  const member = await message.guild.members.fetch({ user: message.author.id, force: true }).catch(() => null);
   if (!member) timeout = 'gone';
-  else if (!member.moderatable) timeout = 'perm';
+  else if ((member.communicationDisabledUntilTimestamp || 0) >= Date.now() + TIMEOUT_MS) {
+    // 관리자나 다른 제재가 이미 더 긴 타임아웃을 걸었으면 10분으로 줄이지 않는다
+    // (28일 초과 타임아웃은 timeoutRenewer 가 만료 시각으로 이어붙이므로 줄이면 추적이 끊긴다)
+    timeout = 'kept';
+  } else if (!member.moderatable) timeout = 'perm';
   else {
     try {
       await member.timeout(TIMEOUT_MS, REASON);
@@ -157,6 +174,8 @@ async function describeActions(actions, lang) {
     out.push(await tl(lang, actions.dm ? 'chat.dmSent' : 'chat.dmFailed'));
   } else if (actions.timeout === 'ok') {
     out.push(await tl(lang, 'sanction.timeout', { dur: humanizeDuration(TIMEOUT_MS) }));
+  } else if (actions.timeout === 'kept') {
+    out.push(await tl(lang, 'chat.timeoutKept'));
   } else if (actions.timeout === 'gone') {
     out.push(await tl(lang, 'sanction.failGone'));
   } else {

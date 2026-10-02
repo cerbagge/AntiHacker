@@ -48,7 +48,8 @@ async function chat(messages, { format, numPredict, timeoutMs }) {
       stream: false,
       keep_alive: -1, // 상주 — 매 메시지마다 모델 재로딩 방지
       ...(format ? { format } : {}),
-      options: { temperature: 0, num_ctx: 2048, num_predict: numPredict },
+      // 판정 대상은 잘라내지 않으므로(디스코드 최대 4000자) 넉넉히. 판정·요약이 같은 값이어야 모델을 다시 올리지 않는다
+      options: { temperature: 0, num_ctx: 8192, num_predict: numPredict },
     }),
     signal: AbortSignal.timeout(timeoutMs),
   });
