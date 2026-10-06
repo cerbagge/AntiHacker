@@ -240,6 +240,37 @@ async function downloadAttachment(url) {
 }
 
 /**
+ * 움직이는 이미지는 프레임을 이어붙이고, Jimp 0.x 가 못 읽는 포맷(webp/avif/heic/svg 등)은
+ * PNG 로 변환해 디코드한다. 실패 시 null. → { image, buffer(실제로 디코드한 버퍼) }
+ */
+async function decodeImage(buffer) {
+  buffer = await stackFrames(buffer);
+  try {
+    return { image: await Jimp.read(buffer), buffer };
+  } catch {
+    try {
+      const png = await convertToPng(buffer);
+      if (!png) throw new Error('지원하지 않는 이미지 형식');
+      return { image: await Jimp.read(png), buffer: png };
+    } catch (e) {
+      logger.warn('이미지 디코드 실패(스캠 스캔 스킵)', { error: e.message });
+      return null;
+    }
+  }
+}
+
+/** scanImage 와 같은 방식으로 256bit dHash 만 계산 (OCR/AI 없음). 실패 시 null */
+async function hashImage(buffer) {
+  const decoded = await decodeImage(buffer);
+  if (!decoded) return null;
+  try {
+    return computeDHash(decoded.image);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 이미지 한 장 스캔
  * @returns {Promise<object>} { autoDelete, suspicious, dangerPercent, confidence, reason, signals, phash, ocrText, qrUrl, source }
  */
@@ -257,25 +288,10 @@ async function scanImage(buffer, mimeType, messageText, lang = DEFAULT_LANG) {
     source: 'local',
   };
 
-  buffer = await stackFrames(buffer);
-
-  let image;
-  try {
-    image = await Jimp.read(buffer);
-  } catch {
-    // Jimp 0.x 가 못 읽는 포맷(webp/avif/heic/svg 등) → PNG 변환 후 재시도.
-    // 변환된 PNG는 VLM에도 그대로 쓴다.
-    try {
-      const png = await convertToPng(buffer);
-      if (!png) throw new Error('지원하지 않는 이미지 형식');
-      buffer = png;
-      image = await Jimp.read(buffer);
-    } catch (e) {
-      // 디코드 불가(실제 이미지 아님 등) → 스캠 아님으로 통과
-      logger.warn('이미지 디코드 실패(스캠 스캔 스킵)', { error: e.message });
-      return base;
-    }
-  }
+  const decoded = await decodeImage(buffer);
+  if (!decoded) return base; // 디코드 불가(실제 이미지 아님 등) → 스캠 아님으로 통과
+  const { image } = decoded;
+  buffer = decoded.buffer; // 변환된 PNG는 VLM에도 그대로 쓴다
 
   // 1) 이미지 해시 — 알려진 스캠과 일치하면 즉시 차단
   let imgHash = null;
@@ -438,9 +454,9 @@ async function scanImage(buffer, mimeType, messageText, lang = DEFAULT_LANG) {
     }
   }
 
-  // 해시 블록리스트는 이후 OCR/AI 없이 100%로 즉시 삭제하는 fast-path라 오탐이 영구히 굳는다.
-  // → AI가 개입하지 않은 로컬 확정 삭제만 학습한다.
-  if (localAutoDelete && imgHash && !known) {
+  // 삭제 판정된 이미지는 해시로 학습 → 같은 이미지가 다시 오면 OCR/AI 없이 즉시 삭제.
+  // (VLM 확정 삭제도 로컬 신호 2종+점수 45 뒷받침이 있어야만 나오므로 함께 학습)
+  if (autoDelete && imgHash && !known) {
     scamHashStore.addScamHash(imgHash);
   }
 
@@ -521,4 +537,4 @@ async function shutdown() {
   }
 }
 
-module.exports = { scanImage, scanMessageImages, downloadAttachment, isImageAttachment, shutdown };
+module.exports = { scanImage, scanMessageImages, downloadAttachment, isImageAttachment, hashImage, shutdown };
