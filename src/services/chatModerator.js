@@ -7,11 +7,14 @@
  *    (처벌이 아니라 안내라서 놓치는 쪽이 더 위험 — 실측에서 "약 다 먹고 끝낼거야"가 0.8로 나옴)
  *  - 그 외 0.7 ≤ conf < 0.9 : 조치 없이 로그에 '의심'으로만 남김
  * 로그 채널에는 원문 대신 LLM 요약 + 참여자 + 처벌 결과만 출력한다. (서버 로그에도 원문을 남기지 않음)
+ * CHAT_MOD_LOG_ONLY=true(관찰 모드)면 삭제·타임아웃·DM 없이 '조치했을 판정'을 로그로만 남긴다.
+ * CHAT_MOD_LOG_USER_ID 가 있으면 로그를 서버 로그 채널 대신 그 유저(봇 운영자) DM으로만 한국어로 보낸다.
  *
  * LLM은 CPU에서 메시지당 수 초 걸리므로 한 번에 하나씩 순서대로 처리하고, 밀린 메시지가
  * 너무 많으면 새 메시지 검사는 건너뛴다(fail-open). 메시지 처리 흐름(스캠 검사 등)은 막지 않는다.
  */
 const { EmbedBuilder } = require('discord.js');
+const config = require('../config');
 const logger = require('../utils/logger');
 const experimentalGuildStore = require('./experimentalGuildStore');
 const chatSafetyService = require('./chatSafetyService');
@@ -28,6 +31,7 @@ const ALERT_CONFIDENCE = 0.7;
 const TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_PENDING = 30;
 const REASON = 'antihacker+ 실험 기능: 유해 채팅 자동 조치';
+const DM_LOG_LANG = 'ko'; // DM 로그 수신자(봇 운영자)는 한국어 사용
 
 // 판정할 필요 없는 메시지: 글자가 없거나 ㅋㅋ/ㅠㅠ/문장부호뿐인 것 (문맥 버퍼에는 남긴다)
 const TRIVIAL = /^[\sㅋㅎㅠㅜ.,!?~^…]*$/u;
@@ -81,16 +85,21 @@ async function review(message, window) {
   if (!verdict || verdict.category === 'none' || verdict.confidence < ALERT_CONFIDENCE) return;
   if (!experimentalGuildStore.isExperimental(message.guild.id)) return; // 판정하는 사이 빠진 경우
 
-  const act = verdict.confidence >= (verdict.category === 'self_harm' ? ALERT_CONFIDENCE : ACTION_CONFIDENCE);
+  const wouldAct = verdict.confidence >= (verdict.category === 'self_harm' ? ALERT_CONFIDENCE : ACTION_CONFIDENCE);
+  const act = wouldAct && !config.CHAT_MOD_LOG_ONLY;
   const lang = guildConfigStore.getLanguage(message.guild.id);
 
-  // 조치를 먼저 끝내고(빠르게) 요약은 그 뒤에 만든다(요약은 CPU에서 10초 이상 걸릴 수 있음).
-  // 로그 채널이 없으면 요약을 보여줄 곳이 없으므로 만들지 않는다(대기열을 오래 붙잡지 않도록).
-  const actions = act ? await enforce(message, verdict.category, lang) : null;
-  const hasLogChannel = !!guildConfigStore.getLogChannel(message.guild.id);
-  const summary = hasLogChannel ? await chatSafetyService.summarize(lines, verdict.category, lang) : null;
+  // 로그는 운영자 DM(설정 시) 또는 서버 로그 채널로 간다. DM이면 서버 언어와 무관하게 한국어.
+  const dmUserId = config.CHAT_MOD_LOG_USER_ID;
+  const logLang = dmUserId ? DM_LOG_LANG : lang;
 
-  logger.warn(`[실험] 유해 채팅 ${act ? '조치' : '의심(조치 안 함)'}`, {
+  // 조치를 먼저 끝내고(빠르게) 요약은 그 뒤에 만든다(요약은 CPU에서 10초 이상 걸릴 수 있음).
+  // 로그를 보낼 곳이 없으면 요약을 만들지 않는다(대기열을 오래 붙잡지 않도록).
+  const actions = act ? await enforce(message, verdict.category, lang) : null;
+  const hasLogTarget = !!dmUserId || !!guildConfigStore.getLogChannel(message.guild.id);
+  const summary = hasLogTarget ? await chatSafetyService.summarize(lines, verdict.category, logLang) : null;
+
+  logger.warn(`[실험] 유해 채팅 ${act ? '조치' : wouldAct ? '감지(관찰 모드)' : '의심(조치 안 함)'}`, {
     guild: message.guild.name,
     channel: message.channel.id,
     author: message.author.tag,
@@ -99,9 +108,18 @@ async function review(message, window) {
     deleted: actions?.del.deleted,
   });
 
-  if (!hasLogChannel) return;
-  const embed = await buildEmbed(message, window, verdict, actions, summary, lang);
-  await guildLogger.logToGuild(message.client, message.guild.id, { embeds: [embed] });
+  if (!hasLogTarget) return;
+  const embed = await buildEmbed(message, window, verdict, actions, wouldAct, summary, logLang, !!dmUserId);
+  if (!dmUserId) {
+    await guildLogger.logToGuild(message.client, message.guild.id, { embeds: [embed] });
+    return;
+  }
+  try {
+    const user = await message.client.users.fetch(dmUserId);
+    await user.send({ embeds: [embed] });
+  } catch (e) {
+    logger.warn('[실험] 채팅 모더레이터 DM 로그 전송 실패', { user: dmUserId, error: e.message });
+  }
 }
 
 /** 삭제 + (자해면 도움 DM, 그 외는 10분 타임아웃) */
@@ -139,15 +157,15 @@ async function enforce(message, category, lang) {
   return { del, timeout };
 }
 
-async function buildEmbed(message, window, verdict, actions, summary, lang) {
+async function buildEmbed(message, window, verdict, actions, wouldAct, summary, lang, showGuild) {
   const counts = new Map();
   for (const w of window) counts.set(w.authorId, (counts.get(w.authorId) || 0) + 1);
   const participants = [...counts].map(([id, n]) => `<@${id}> ×${n}`).join('\n');
 
   const cat = await tl(lang, `chat.cat.${verdict.category}`);
   const embed = new EmbedBuilder()
-    .setTitle(await tl(lang, actions ? 'title.chatAction' : 'title.chatSuspect'))
-    .setColor(actions ? 0xed4245 : 0xfee75c)
+    .setTitle(await tl(lang, actions ? 'title.chatAction' : wouldAct ? 'title.chatLogOnly' : 'title.chatSuspect'))
+    .setColor(actions ? 0xed4245 : wouldAct ? 0xe67e22 : 0xfee75c)
     .setThumbnail(message.author.displayAvatarURL())
     .setDescription(`**${await tl(lang, 'field.summary')}**\n${(summary || (await tl(lang, 'chat.summaryFailed'))).slice(0, 1500)}`)
     .addFields(
@@ -155,19 +173,21 @@ async function buildEmbed(message, window, verdict, actions, summary, lang) {
       { name: await tl(lang, 'field.channel'), value: `<#${message.channel.id}>`, inline: true },
       { name: await tl(lang, 'field.category'), value: await tl(lang, 'chat.confidence', { cat, pct: Math.round(verdict.confidence * 100) }), inline: true },
       { name: await tl(lang, 'field.participants', { n: window.length }), value: participants.slice(0, 1024) },
-      { name: await tl(lang, 'field.action'), value: await describeActions(actions, lang) },
+      { name: await tl(lang, 'field.action'), value: await describeActions(actions, wouldAct, lang) },
     )
     .setTimestamp();
+  // DM 로그는 여러 서버가 한곳에 모이므로 어느 서버인지 맨 앞에 보여준다
+  if (showGuild) embed.spliceFields(0, 0, { name: await tl(lang, 'field.guild'), value: message.guild.name.slice(0, 256), inline: false });
 
   if (actions) await addDeleteFailureNotice(embed, actions.del, lang);
-  if (actions && verdict.category === 'self_harm') {
+  if (wouldAct && verdict.category === 'self_harm') {
     embed.addFields({ name: '​', value: await tl(lang, 'chat.careNeeded') });
   }
   return embed;
 }
 
-async function describeActions(actions, lang) {
-  if (!actions) return tl(lang, 'chat.noAction');
+async function describeActions(actions, wouldAct, lang) {
+  if (!actions) return tl(lang, wouldAct ? 'chat.logOnly' : 'chat.noAction');
   const out = [await tl(lang, actions.del.deleted ? 'chat.deleted' : 'chat.notDeleted')];
   if ('dm' in actions) {
     out.push(await tl(lang, 'chat.noTimeoutSelfHarm'));

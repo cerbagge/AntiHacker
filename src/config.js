@@ -56,4 +56,8 @@ module.exports = Object.freeze({
   // ── 채팅 모더레이터 (실험 기능) ──
   // experimentalGuilds.json 에 적힌 서버에서만 동작. 판정·요약에 쓸 Ollama 텍스트 모델.
   CHAT_MOD_MODEL: process.env.CHAT_MOD_MODEL || 'exaone3.5:7.8b',
+  // 관찰 모드: true 면 삭제·타임아웃·DM 없이 로그만 남긴다 (실험 서버에서 오탐을 먼저 지켜볼 때)
+  CHAT_MOD_LOG_ONLY: process.env.CHAT_MOD_LOG_ONLY === 'true',
+  // 로그를 받을 유저 ID: 있으면 서버 로그 채널 대신 이 유저 DM으로만 보낸다 (봇과 서버를 하나 이상 공유해야 DM 가능)
+  CHAT_MOD_LOG_USER_ID: (process.env.CHAT_MOD_LOG_USER_ID || '').trim(),
 });
