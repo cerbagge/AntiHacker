@@ -10,10 +10,24 @@ const virusScanner = require('../services/virusScanner');
 const guildConfigStore = require('../services/guildConfigStore');
 const imageQueue = require('../services/imageQueue');
 const chatModerator = require('../services/chatModerator');
+const hashGuard = require('../services/hashGuard');
 const logger = require('../utils/logger');
 
 // antihacker+는 완전 로컬: 모든 위협은 S(스팸/사기) 카테고리로 본다 (Gemini 미사용)
 const SCAM_BREAKDOWN = { A: 0, V: 0, H: 0, P: 0, S: 100 };
+
+/** 일반 첨부파일 + 전달(forward) 메시지의 첨부파일·원문을 합침 */
+function collect(message) {
+  const attachments = [...message.attachments.values()];
+  let content = message.content || '';
+  if (message.messageSnapshots?.size > 0) {
+    for (const snapshot of message.messageSnapshots.values()) {
+      if (snapshot.attachments?.size > 0) attachments.push(...snapshot.attachments.values());
+      if (snapshot.content) content += '\n' + snapshot.content;
+    }
+  }
+  return { attachments, content };
+}
 
 module.exports = (client) => {
   client.on('messageCreate', async (message) => {
@@ -25,6 +39,9 @@ module.exports = (client) => {
     if (message.guild) {
       const trapId = guildConfigStore.getSpamChannel(message.guild.id);
       if (trapId && message.channel.id === trapId) {
+        // 삭제 전에 학습(첨부 다운로드)을 먼저 시작 — 삭제된 메시지의 첨부는 곧 내려간다
+        const { attachments, content } = collect(message);
+        hashGuard.learnDeleted(content, attachments);
         await scamResponder.handleHoneypot(message);
         return;
       }
@@ -38,16 +55,7 @@ module.exports = (client) => {
     chatModerator.observe(message);
 
     try {
-      // 일반 첨부파일 + 전달(forward) 메시지의 첨부파일을 합침
-      const allAttachments = [...message.attachments.values()];
-      let allContent = message.content || '';
-
-      if (message.messageSnapshots?.size > 0) {
-        for (const snapshot of message.messageSnapshots.values()) {
-          if (snapshot.attachments?.size > 0) allAttachments.push(...snapshot.attachments.values());
-          if (snapshot.content) allContent += '\n' + snapshot.content;
-        }
-      }
+      const { attachments: allAttachments, content: allContent } = collect(message);
 
       const hasAttachments = allAttachments.length > 0;
       const hasUrls = linkScanner.extractUrls(allContent).length > 0;
@@ -56,6 +64,17 @@ module.exports = (client) => {
 
       // 이 서버의 로그 언어 (기본 en) — 감지 사유를 해당 언어로 생성
       const lang = guildConfigStore.getLanguage(message.guild?.id);
+
+      // ── 해시 즉시삭제 ──
+      // 전에 삭제 처리한 글/이미지와 똑같으면 대기열·바이러스 검사·OCR/AI 없이 바로 삭제.
+      if (message.guild) {
+        const known = await hashGuard.checkKnown(allContent, allAttachments, lang);
+        if (known) {
+          hashGuard.learnDeleted(allContent, allAttachments); // 같이 온 다른 글/이미지도 학습
+          await scamResponder.handleScamDelete(message, known);
+          return;
+        }
+      }
 
       // ── [안정장치] 이미지 처리 동시성 상한 + 대기열 ──
       // 다운로드 전에 슬롯을 잡아, 대기 메시지는 버퍼를 안 들게 한다(메모리=동시처리 수로 고정).
@@ -82,6 +101,7 @@ module.exports = (client) => {
             attachmentBuffers.set(att.url, buffer);
             const scan = await virusScanner.scanBuffer(buffer, att.name);
             if (!scan.clean) {
+              hashGuard.learnDeleted(allContent, allAttachments, attachmentBuffers);
               await scamResponder.handleVirusDelete(message, att, scan);
               return; // 악성코드 감지 → 삭제 + 알림 완료, 종료
             }
@@ -95,6 +115,7 @@ module.exports = (client) => {
           if (scamImages.length > 0) {
             const scamResult = await scamImageScanner.scanMessageImages(scamImages, allContent, attachmentBuffers, lang);
             if (scamResult.autoDelete) {
+              hashGuard.learnDeleted(allContent); // 이미지 해시는 스캐너가 이미 학습
               await scamResponder.handleScamDelete(message, scamResult);
               return; // 삭제 + 로그 완료 → 종료
             }
@@ -119,6 +140,7 @@ module.exports = (client) => {
       if (config.INVITE_GUARD_ENABLED && message.guild) {
         const inviteVerdict = await inviteScanner.scanMessageInvites(message.client, allContent, message.guild.id, lang);
         if (inviteVerdict) {
+          if (!inviteVerdict.advisory) hashGuard.learnDeleted(allContent, allAttachments); // advisory 는 삭제 안 함
           await scamResponder.handleNsfwInviteDelete(message, inviteVerdict);
           return; // 삭제 + 로그 완료 → 종료
         }
