@@ -4,9 +4,11 @@
  * 한 번 "고신뢰 스캠"으로 판정되어 삭제된 이미지의 perceptual hash(64bit 이진 문자열)를
  * 저장해 둔다. 같은(혹은 거의 같은) 이미지가 다시 올라오면 OCR/AI 없이 즉시 차단한다.
  * 이 스캠은 동일 이미지가 서버마다 반복 게시되므로 가장 싸고 효과적인 1차 필터.
+ * 삭제된 메시지의 글 내용도 SHA-256 으로 저장해, 똑같은 글이 다시 올라오면 즉시 지운다.
  *
  * 저장 방식은 기존 optoutStore.js 컨벤션을 따름 (루트에 JSON 파일).
  */
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const logger = require('../utils/logger');
@@ -24,12 +26,18 @@ const MAX_ENTRIES = 5000; // 과도한 증가 방지
 // 먼저 돌아 영구 삭제로 굳는다 → 버리고 다시 학습한다. 원본은 .legacy 파일로 보관.
 const STORE_VERSION = 2;
 
+// 삭제된 메시지 글 내용의 SHA-256 — 똑같은 글이 다시 올라오면 즉시 삭제.
+// "ㅎㅇ"·"이 채널 뭐임" 같은 짧은 글이 전역 차단어가 되지 않도록 정규화 후 이 길이 미만은 학습/매칭하지 않는다.
+const MIN_TEXT_LEN = 15;
+
 let hashes = [];
+let texts = new Set();
 try {
   if (fs.existsSync(HASH_PATH)) {
     const data = JSON.parse(fs.readFileSync(HASH_PATH, 'utf-8'));
     if (data && data.version === STORE_VERSION && Array.isArray(data.hashes)) {
       hashes = data.hashes;
+      if (Array.isArray(data.texts)) texts = new Set(data.texts);
     } else {
       const legacyPath = `${HASH_PATH}.legacy-v${(data && data.version) || 1}`;
       fs.renameSync(HASH_PATH, legacyPath);
@@ -46,7 +54,7 @@ try {
 
 function save() {
   try {
-    const data = { version: STORE_VERSION, hashes: hashes.slice(-MAX_ENTRIES) };
+    const data = { version: STORE_VERSION, hashes: hashes.slice(-MAX_ENTRIES), texts: [...texts].slice(-MAX_ENTRIES) };
     fs.writeFileSync(HASH_PATH, JSON.stringify(data, null, 0));
   } catch (e) {
     logger.warn('scamHashes.json 저장 실패', { error: e.message });
@@ -82,8 +90,32 @@ function addScamHash(hash) {
   return true;
 }
 
+/** 글 내용 해시: 소문자 + 공백 단일화 후 SHA-256. 너무 짧으면 null */
+function textHash(text) {
+  const norm = String(text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (norm.length < MIN_TEXT_LEN) return null;
+  return crypto.createHash('sha256').update(norm).digest('hex');
+}
+
+/** 삭제된 적 있는 글과 똑같은지 */
+function matchKnownText(text) {
+  const h = textHash(text);
+  return Boolean(h && texts.has(h));
+}
+
+/** 삭제된 글 내용 해시 추가 */
+function addScamText(text) {
+  const h = textHash(text);
+  if (!h || texts.has(h)) return false;
+  texts.add(h);
+  save();
+  return true;
+}
+
 function count() {
   return hashes.length;
 }
 
-module.exports = { matchKnownScam, addScamHash, hammingDistance, count, DEFAULT_MAX_DISTANCE };
+module.exports = {
+  matchKnownScam, addScamHash, matchKnownText, addScamText, hammingDistance, count, DEFAULT_MAX_DISTANCE,
+};
