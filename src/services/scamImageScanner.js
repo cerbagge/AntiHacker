@@ -6,7 +6,7 @@
  *   2) OCR         — tesseract.js (한국어+영어) 로 이미지 속 글자 추출
  *   3) QR          — jsQR 로 QR 코드 안의 링크 해독
  *   4) 패턴 점수    — cryptoScamPatterns + linkScanner 로 신호 가중 합산
- *   5) 로컬 VLM     — 점수가 애매하거나 글자가 거의 없을 때만 Ollama 호출 (없으면 건너뜀)
+ *   5) 최종 검수    — 점수가 애매하거나 글자가 거의 없을 때만 Claude(설정 시) → 실패하면 로컬 VLM(Ollama)
  *
  * 결과의 dangerPercent / 임계값으로 자동삭제 여부를 정한다. 오삭제를 막기 위해
  * 자동삭제는 "점수 임계값 이상 + 서로 다른 신호 2종류 이상"을 모두 만족해야 한다.
@@ -25,6 +25,7 @@ const patterns = require('../constants/cryptoScamPatterns');
 const linkScanner = require('./linkScanner');
 const scamHashStore = require('./scamHashStore');
 const localVlmService = require('./localVlmService');
+const claudeReviewService = require('./claudeReviewService');
 const pdfRenderer = require('./pdfRenderer');
 const { t, DEFAULT_LANG } = require('./i18n');
 
@@ -438,18 +439,21 @@ async function scanImage(buffer, mimeType, messageText, lang = DEFAULT_LANG) {
   const localCorroborated = tagCount >= 2 && score >= SUSPICIOUS_THRESHOLD;
 
   if (candidate) {
-    const vlm = await localVlmService.analyzeImage(buffer);
+    // Claude 최종 검수 우선 — 미설정·오류·거부면 null 이 와서 로컬 VLM으로 전환 (판정 기준은 동일)
+    const claude = await claudeReviewService.analyzeImage(buffer);
+    const vlm = claude || await localVlmService.analyzeImage(buffer);
+    const by = claude ? 'claude' : 'vlm';
     if (vlm) {
-      signals.push(`vlm(scam=${vlm.scam},conf=${vlm.confidence.toFixed(2)})`);
+      signals.push(`${claude ? claude.model : 'vlm'}(scam=${vlm.scam},conf=${vlm.confidence.toFixed(2)})`);
       if (vlm.scam && vlm.confidence >= 0.8 && localCorroborated && !tradingWhitelisted) {
         autoDelete = true;
         suspicious = true;
         score = Math.max(score, 90);
-        reasons.push(t(lang, 'reason.vlmScam', { pct: Math.round(vlm.confidence * 100), detail: vlm.reason }));
+        reasons.push(t(lang, `reason.${by}Scam`, { pct: Math.round(vlm.confidence * 100), detail: vlm.reason }));
       } else if (vlm.scam && vlm.confidence >= 0.5) {
         // 로컬 뒷받침이 없는 AI 단독 판정 → 삭제·제재 없이 관리자 알림만(의심)
         suspicious = true;
-        reasons.push(t(lang, 'reason.vlmSuspect', { pct: Math.round(vlm.confidence * 100), detail: vlm.reason }));
+        reasons.push(t(lang, `reason.${by}Suspect`, { pct: Math.round(vlm.confidence * 100), detail: vlm.reason }));
       }
     }
   }

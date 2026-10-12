@@ -25,6 +25,13 @@ module.exports = Object.freeze({
   OLLAMA_URL: process.env.OLLAMA_URL || 'http://127.0.0.1:11434',
   OLLAMA_VLM_MODEL: process.env.OLLAMA_VLM_MODEL || 'qwen2.5vl:7b',
   OLLAMA_TIMEOUT_MS: parseInt(process.env.OLLAMA_TIMEOUT_MS, 10) || 180000,
+  // Claude 최종 검수 — ANTHROPIC_API_KEY 가 있으면 VLM 단계에서 Claude 를 먼저 쓴다.
+  // 1차 CLAUDE_MODEL 이 판단을 못 하면(거부·확신도 0.8 미만) CLAUDE_ESCALATION_MODEL 에 다시 묻고,
+  // API 오류·한도 소진·타임아웃이면 로컬 VLM(Ollama)으로 자동 전환. 키가 없으면 로컬만 사용.
+  CLAUDE_REVIEW_ENABLED: Boolean(process.env.ANTHROPIC_API_KEY),
+  CLAUDE_MODEL: process.env.CLAUDE_MODEL || 'claude-haiku-5-5',
+  CLAUDE_ESCALATION_MODEL: process.env.CLAUDE_ESCALATION_MODEL || 'claude-sonnet-5-5',
+  CLAUDE_TIMEOUT_MS: parseInt(process.env.CLAUDE_TIMEOUT_MS, 10) || 30000,
 
   // ── 첨부 바이러스 검사 (ClamAV, 로컬 clamd 데몬) ──
   // AI가 아니라 시그니처 기반이라 가벼움 → RAM 업그레이드와 무관하게 동작. ClamAV 없으면 자동 스킵.
