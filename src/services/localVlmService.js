@@ -271,4 +271,4 @@ async function analyzeImage(buffer) {
   }
 }
 
-module.exports = { analyzeImage, analyzeDiscordServer, analyzeLinkMessage, isAvailable };
+module.exports = { analyzeImage, analyzeDiscordServer, analyzeLinkMessage, isAvailable, PROMPT };
