@@ -1,33 +1,59 @@
 # AntiHacker (antihacker+)
 
-Discord 코인 스캠/스팸 이미지·초대 링크를 **온디바이스(로컬) AI** 로 판별해 자동 삭제하는 봇.
-외부 API 없이 봇이 도는 서버에서 직접 추론하며, 로컬 도구가 없으면 해당 단계는 자동으로 건너뜁니다.
+Discord 코인 스캠/스팸 이미지·초대 링크를 **온디바이스(로컬) AI** 중심으로 판별해 자동 삭제하는 봇.
+봇이 도는 서버에서 직접 추론하며, 로컬 도구가 없으면 해당 단계는 자동으로 건너뜁니다.
+애매한 이미지의 최종 판정만 **선택적으로 Claude API**(Haiku 5.5 → Sonnet 5.5)를 쓰고,
+API 키가 없거나 오류·한도 소진이면 로컬 VLM이 대신 판정합니다.
 
-## 사용한 로컬 AI / 도구
+## 사용한 AI / 도구
 
 | 단계 | 도구 | 용도 |
 |------|------|------|
-| 비전 판정(VLM) | **Ollama + Qwen2.5-VL 7B** (`qwen2.5vl:7b`) | OCR·패턴 점수가 애매할 때 이미지를 눈으로 보고 스캠 여부 최종 판정 |
+| 최종 검수 *(선택, 클라우드)* | **Claude API** — Haiku 5.5 → Sonnet 5.5 | OCR·패턴 점수가 애매한 이미지를 먼저 Claude가 판정. [아래 설명](#claude-최종-검수-선택) |
+| 비전 판정(VLM) | **Ollama + Qwen2.5-VL 7B** (`qwen2.5vl:7b`) | Claude 미설정·오류 시 이미지를 눈으로 보고 스캠 여부 최종 판정 |
 | 문자 인식(OCR) | **Tesseract.js** (한국어+영어, `kor+eng`) | 이미지 속 글자 추출 (traineddata 동봉) |
 | 바이러스 검사 | **ClamAV** (`clamdscan` 데몬) | 모든 첨부를 시그니처 기반으로 검사, 감염 시 삭제 |
 | PDF 렌더링 | **Poppler** (`poppler-utils`) | PDF 앞 3페이지를 이미지로 바꿔 스캠 검사, 텍스트·숨은 링크 추출 |
 | 채팅 판정(실험) | **Ollama + EXAONE 3.5 7.8B** (`exaone3.5:7.8b`) | 실험 서버에서 최근 6줄 대화를 보고 유해 메시지 판정 + 로그용 요약 |
 
-탐지 파이프라인(싼 것 → 비싼 것): **이미지 해시(dHash) → QR 해독 → OCR → 패턴 점수 → 로컬 VLM**.
+탐지 파이프라인(싼 것 → 비싼 것): **이미지 해시(dHash) → QR 해독 → OCR → 패턴 점수 → 최종 검수(Claude → 실패 시 로컬 VLM)**.
 점수 임계값 이상 + 서로 다른 신호 2종류 이상일 때만 자동 삭제해 오삭제를 막습니다.
 
 **해시 즉시삭제**: 봇이 스팸으로 삭제 처리한 메시지(스캠 이미지·허니팟·NSFW 초대·바이러스)의 글 내용(SHA-256)과
 이미지(dHash)를 `scamHashes.json` 에 학습합니다. 똑같은 글/이미지가 다시 올라오면 대기열·바이러스 검사·OCR/AI 없이 바로 삭제합니다.
 (글은 대소문자·공백만 무시한 완전 일치, 15자 미만은 학습 안 함. 채팅 모더레이터 삭제는 문맥 판정이라 학습하지 않음)
 
-> 로컬 도구는 모두 **선택**입니다. Ollama/ClamAV/Poppler가 없으면 그 단계는 조용히 스킵되고,
-> 해시·OCR·패턴 점수만으로도 동작합니다. VLM은 CPU 추론이라 느리므로 애매한 이미지에만 호출됩니다.
+> 로컬 도구와 Claude API는 모두 **선택**입니다. Ollama/ClamAV/Poppler/API 키가 없으면 그 단계는 조용히 스킵되고,
+> 해시·OCR·패턴 점수만으로도 동작합니다. 최종 검수(Claude·VLM)는 애매한 이미지에만 호출됩니다.
+
+## Claude 최종 검수 (선택)
+
+`.env` 에 `ANTHROPIC_API_KEY` 가 있으면 VLM 단계에서 로컬 VLM보다 Claude를 먼저 씁니다.
+
+```
+로컬 OCR·패턴 → (애매한 후보만) Haiku 5.5
+   ├ 확신도 0.8 이상 → 그대로 사용
+   ├ 판단 못 함 (거부 / 형식 오류 / 확신도 0.8 미만) → Sonnet 5.5 에 다시 물음
+   │     └ Sonnet 도 못 하면 → Haiku 의 애매한 판정, 그것도 없으면 로컬 VLM
+   └ API 오류 (한도 소진·429·402·인증 / 타임아웃 30초 / 키 없음) → 로컬 VLM(Ollama)
+```
+
+- **출력**: Claude는 이유 없이 `{"scam": true, "confidence": 0.93}` 만 출력합니다(JSON 스키마로 강제). 로컬 VLM은 성능 보완용으로 이유(`reason`)까지 출력합니다.
+- **오류 시 쉬기**: 오류 난 모델은 `retry-after`(없으면 5분) 동안 호출하지 않고 바로 다음 단계로 넘어갑니다. 요청 자체 문제(400/413)는 그 이미지만 넘깁니다.
+- **안전장치는 그대로**: 로컬 근거(서로 다른 신호 2종 + 점수 45 이상) 없이 AI 단독 판정이면 삭제하지 않고 관리자 알림만 보냅니다.
+- **로그**: 신호에 판정 모델이 남습니다 — `claude-haiku-5-5(scam=true,conf=0.93)`. 디스코드 로그 채널에는 근거를 노출하지 않습니다.
+- **속도**: 이미지당 약 2~4초 (로컬 7B CPU 추론은 1.5~2분).
+- **비용(실측)**: 이미지 1장 ≈ 입력 2,300토큰 + 출력 19토큰 → Haiku 5.5 약 **$0.00024**, Sonnet 5.5 약 $0.0048.
+  Haiku만으로 월 $100 ≈ 41만 장이며, Sonnet 재검수 비율이 늘면 줄어듭니다(5% ≈ 21만 장, 10% ≈ 14만 장).
+  평범한 이미지와 로컬 패턴으로 확정된 스캠은 Claude까지 가지 않습니다.
+- **개인정보**: 키를 넣으면 애매한 후보 이미지가 Anthropic API로 전송됩니다. 완전 로컬로 쓰려면 키를 비워 두세요.
 
 ## 요구 사항
 
 - **Node.js 20.9 이상** (이미지 변환용 `sharp` 요구사항)
 - Discord 봇 토큰
-- (선택) **Ollama** — 이미지 비전 판정을 쓰려면
+- (선택) **Anthropic API 키** — Claude 최종 검수를 쓰려면
+- (선택) **Ollama** — 이미지 비전 판정(또는 Claude 오류 시 대체)을 쓰려면
 - (선택) **ClamAV** — 첨부 바이러스 검사를 쓰려면
 - (선택) **Poppler** — PDF 첨부 스캠 검사를 쓰려면
 
@@ -56,6 +82,20 @@ ollama pull qwen2.5vl:7b
 > 7B 모델은 약 6GB이고, GPU 없는 CPU 추론에서는 이미지당 1.5~2분 걸립니다(i7-8700 실측).
 > 더 가볍게 쓰려면 `ollama pull qwen2.5vl:3b` 후 `.env` 에서 `OLLAMA_VLM_MODEL=qwen2.5vl:3b`,
 > 아예 끄려면 `SCAM_VLM_ENABLED=false` 로 해시/OCR/패턴만 써도 됩니다.
+
+### 2-1) Claude 최종 검수 — Anthropic API 키  *(선택)*
+
+1. [Claude Console](https://platform.claude.com)에서 봇 전용 Workspace를 만들고 **월 지출 한도**를 겁니다
+   (한도를 넘으면 봇이 자동으로 로컬 VLM으로 전환).
+2. 그 Workspace 안에서 API 키를 발급해 `.env` 에 넣습니다. **`.env.example` 에는 넣지 마세요.**
+
+```bash
+# .env
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+> 키를 붙여 넣을 때 Console 목록에 가려 표시되는 앞부분(`sk-ant-...`)이 같이 들어가지 않게 주의하세요 (`401 invalid x-api-key`).
+> `.env` 는 `chmod 600` 으로 본인만 읽게 두는 것을 권장합니다.
 
 ### 3) 바이러스 검사 설치 — ClamAV  *(선택)*
 
@@ -94,6 +134,10 @@ cp .env.example .env
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama 주소 |
 | `OLLAMA_VLM_MODEL` | `qwen2.5vl:7b` | 사용할 비전 모델 |
 | `OLLAMA_TIMEOUT_MS` | `180000` | VLM 응답 대기 한도 (CPU 7B 기준) |
+| `ANTHROPIC_API_KEY` | — | (선택) 있으면 Claude 최종 검수 사용, 비우면 로컬만 |
+| `CLAUDE_MODEL` | `claude-haiku-5-5` | Claude 1차 판정 모델 |
+| `CLAUDE_ESCALATION_MODEL` | `claude-sonnet-5-5` | 1차가 판단을 못 할 때 다시 묻는 모델 |
+| `CLAUDE_TIMEOUT_MS` | `30000` | Claude 응답 대기 한도 (넘으면 로컬 VLM으로) |
 | `VIRUS_SCAN_ENABLED` | `true` | ClamAV 첨부 검사 사용 여부 |
 
 서버 잠금(허용목록)은 루트의 `allowedGuilds.json` 에 서버 ID를 넣어 설정합니다.
