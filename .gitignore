@@ -1,5 +1,7 @@
 node_modules/
-.env
+# .env 및 백업(.env.bak-* 등)은 토큰 포함 → 예시 파일만 추적
+.env*
+!.env.example
 logs/
 credentials.json
 token.json
