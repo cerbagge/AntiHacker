@@ -452,7 +452,9 @@ async function scanImage(buffer, mimeType, messageText, lang = DEFAULT_LANG) {
         reasons.push(t(lang, `reason.${by}Scam`, { pct: Math.round(vlm.confidence * 100), detail: vlm.reason }));
       } else if (vlm.scam && vlm.confidence >= 0.5) {
         // 로컬 뒷받침이 없는 AI 단독 판정 → 삭제·제재 없이 관리자 알림만(의심)
+        // 알림 카드는 위험도 26% 이상일 때만 나가므로, 로컬 점수가 낮아도 '의심' 단계(45)로 올린다
         suspicious = true;
+        score = Math.max(score, SUSPICIOUS_THRESHOLD);
         reasons.push(t(lang, `reason.${by}Suspect`, { pct: Math.round(vlm.confidence * 100), detail: vlm.reason }));
       }
     }

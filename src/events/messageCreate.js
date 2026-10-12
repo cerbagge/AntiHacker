@@ -124,6 +124,7 @@ module.exports = (client) => {
               logger.info('코인 스캠 의심(자동삭제 임계값 미만) → 관리자 알림 대상', {
                 author: message.author.tag,
                 danger: scamSuspicious.dangerPercent,
+                signals: scamSuspicious.signals,
               });
             }
           }
