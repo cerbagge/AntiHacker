@@ -63,8 +63,9 @@ async function toJpeg(buffer) {
   }
 }
 
-/** 이 오류 뒤 그 모델을 얼마나 쉴지(ms) */
+/** 이 오류 뒤 그 모델을 얼마나 쉴지(ms). 413(그 이미지만 너무 큼)은 쉬지 않는다 */
 function pauseMsFor(e) {
+  if (e.status === 413) return 0;
   const retryAfter = Number(e.headers?.get?.('retry-after'));
   if (retryAfter > 0) return retryAfter * 1000;
   return e.status === 400 ? BAD_REQUEST_PAUSE_MS : DEFAULT_PAUSE_MS;
