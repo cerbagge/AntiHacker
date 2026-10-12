@@ -8,6 +8,7 @@
  * null 을 돌려주고, 호출부가 로컬 VLM(Ollama)으로 전환한다.
  * 한도/장애성 오류가 나면 그 모델은 잠시(retry-after, 없으면 기본 5분) 호출을 멈춰
  * 이미지마다 실패를 기다리지 않는다.
+ * 판정 이유(reason)는 받지 않는다 — 스키마로 {scam, confidence} 만 출력하게 강제.
  */
 const Anthropic = require('@anthropic-ai/sdk');
 const Jimp = require('jimp');
@@ -28,9 +29,8 @@ const SCHEMA = {
   properties: {
     scam: { type: 'boolean' },
     confidence: { type: 'number' },
-    reason: { type: 'string' },
   },
-  required: ['scam', 'confidence', 'reason'],
+  required: ['scam', 'confidence'],
   additionalProperties: false,
 };
 
@@ -102,7 +102,6 @@ async function ask(api, model, jpeg) {
     return {
       scam: o.scam === true,
       confidence: Math.min(1, Math.max(0, Number(o.confidence) || 0)),
-      reason: String(o.reason || '').slice(0, 200),
       model,
     };
   } catch {
@@ -113,7 +112,7 @@ async function ask(api, model, jpeg) {
 
 /**
  * @param {Buffer} buffer 이미지 버퍼 (scamImageScanner 가 디코드에 성공한 버퍼)
- * @returns {Promise<{scam:boolean,confidence:number,reason:string,model:string}|null>} null → 로컬 VLM 사용
+ * @returns {Promise<{scam:boolean,confidence:number,model:string}|null>} null → 로컬 VLM 사용
  */
 async function analyzeImage(buffer) {
   const api = getClient();
