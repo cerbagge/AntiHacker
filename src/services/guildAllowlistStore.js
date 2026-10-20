@@ -5,7 +5,7 @@
  * 페일세이프: 목록이 비어 있으면(=미설정) 잠금을 끈다(모든 서버 허용). 실수로 자기
  * 서버에서 봇이 쫓겨나는 것을 막기 위함. 서버 ID를 하나라도 넣으면 잠금이 켜진다.
  *
- * 저장 컨벤션은 optoutStore.js 와 동일(루트 JSON). 런타임 편집 감지를 위해 watchFile 제공.
+ * 저장 컨벤션은 다른 저장소(guildConfigStore 등)와 동일(루트 JSON). 런타임 편집 감지를 위해 watchFile 제공.
  */
 const fs = require('fs');
 const path = require('path');

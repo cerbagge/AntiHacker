@@ -1,7 +1,6 @@
 const config = require('../config');
 const linkScanner = require('../services/linkScanner');
 const fileScanner = require('../services/fileScanner');
-const optoutStore = require('../services/optoutStore');
 const { handleResponse } = require('../services/responseHandler');
 const scamImageScanner = require('../services/scamImageScanner');
 const scamResponder = require('../services/scamResponder');
@@ -40,9 +39,7 @@ module.exports = (client) => {
       const trapId = guildConfigStore.getSpamChannel(message.guild.id);
       if (trapId && message.channel.id === trapId) {
         const { attachments, content } = collect(message);
-        // 학습거부 유저의 글은 Claude(외부)로 보내지 않는다 — 로컬 VLM으로만 판정
-        const allowCloud = !optoutStore.isOptedOut(message.author.id);
-        const { verdict, buffers } = await scamResponder.handleHoneypot(message, { content, attachments, allowCloud });
+        const { verdict, buffers } = await scamResponder.handleHoneypot(message, { content, attachments });
         // AI가 스팸이라고 했을 때만 학습 (AI 판정 불가·일반 글은 학습 안 함). 이미지는 받아 둔 것만
         if (verdict === 'spam') {
           hashGuard.learnDeleted(content, attachments.filter((a) => buffers.has(a.url)), buffers);
@@ -50,9 +47,6 @@ module.exports = (client) => {
         return;
       }
     }
-
-    // 학습거부 유저는 수집하지 않음
-    if (optoutStore.isOptedOut(message.author.id)) return;
 
     // ── 채팅 모더레이터 (실험 기능, experimentalGuilds.json 서버만) ──
     // 최근 6줄 흐름을 로컬 LLM이 판정 → 유해하면 삭제 + 10분 타임아웃. 대기열로 따로 돌아서 아래 검사를 막지 않는다.
