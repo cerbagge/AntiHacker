@@ -1,7 +1,7 @@
 /**
  * 누적 탐지 통계 — 재시작해도 유지되도록 루트 JSON에 저장한다.
  * 현재는 "탐지 완료(삭제·제재가 실행된) 총 건수" 하나만 집계한다. (봇 상태 표시용)
- * 저장 방식은 기존 optoutStore/scamHashStore 컨벤션을 따름 (루트에 JSON 파일).
+ * 저장 방식은 기존 scamHashStore 컨벤션을 따름 (루트에 JSON 파일).
  */
 const fs = require('fs');
 const path = require('path');

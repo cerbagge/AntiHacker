@@ -6,7 +6,7 @@
  * verdict:
  *   'spam'        — AI가 스팸으로 판정 → 스윕 + 제재 + 해시 학습
  *   'clean'       — AI가 일반 유저 실수로 판정 → 삭제 + 로그만
- *   'unavailable' — Claude 를 못 씀(키 없음·오류·시간 초과·과부하·학습거부 유저) 또는 판정을 믿기 어려움(확신도 낮음·못 본 이미지)
+ *   'unavailable' — Claude 를 못 씀(키 없음·오류·시간 초과·과부하) 또는 판정을 믿기 어려움(확신도 낮음·못 본 이미지)
  *                   → 스윕 + 제재, 해시 학습은 안 함
  *
  * 동시성: 판정은 동시에 MAX_INFLIGHT 건까지만 돌린다. 넘치면 다운로드·AI 없이 'unavailable'.
@@ -44,15 +44,14 @@ function describe(content, attachments) {
 }
 
 /**
- * @param {{content?:string, attachments?:Array, images?:Buffer[], expectedImages?:number, allowCloud?:boolean}} input
- *   images: Jimp 로 읽히는 버퍼(첨부 순서), expectedImages: 메시지의 이미지 첨부 수,
- *   allowCloud: false 면 Claude 로 보내지 않는다 → 판정 불가 (학습거부 유저)
+ * @param {{content?:string, attachments?:Array, images?:Buffer[], expectedImages?:number}} input
+ *   images: Jimp 로 읽히는 버퍼(첨부 순서), expectedImages: 메시지의 이미지 첨부 수
  * @returns {Promise<{verdict:'spam'|'clean'|'unavailable', model:string|null, confidence:number|null, note?:string}>}
  */
-async function judge({ content = '', attachments = [], images = [], expectedImages = images.length, allowCloud = true } = {}) {
+async function judge({ content = '', attachments = [], images = [], expectedImages = images.length } = {}) {
   const text = describe(content, attachments);
 
-  const ai = allowCloud ? await claudeReviewService.analyzeHoneypot(text, images) : null;
+  const ai = await claudeReviewService.analyzeHoneypot(text, images);
   if (!ai || typeof ai.spam !== 'boolean') return unavailable('no-ai');
   const { model } = ai;
   const seen = Math.min(images.length, claudeReviewService.HONEYPOT_MAX_IMAGES);
@@ -75,13 +74,13 @@ function own(userId, attachments, prefetch) {
   const prefetched = prefetch ? hashGuard.prefetch(attachments) : Promise.resolve(new Map());
 
   return {
-    async finish(content, allowCloud) {
+    async finish(content) {
       let ai = unavailable('error');
       try {
         const buffers = await prefetched;
         const images = (await Promise.all([...buffers.values()].map(scamImageScanner.toReadableImage))).filter(Boolean);
         const expectedImages = hashGuard.hashableImages(attachments).length;
-        ai = await judge({ content, attachments, images, expectedImages, allowCloud });
+        ai = await judge({ content, attachments, images, expectedImages });
         return { ai, buffers };
       } finally {
         inflight.delete(userId);
@@ -91,23 +90,23 @@ function own(userId, attachments, prefetch) {
   };
 }
 
-async function afterPending(pending, userId, attachments, content, allowCloud) {
+async function afterPending(pending, userId, attachments, content) {
   const prev = await pending;
   if (prev.verdict !== 'clean') return { ai: prev, buffers: new Map() }; // 이미 스팸(또는 불가)으로 본 유저
   const next = inflight.get(userId); // 다른 대기 글이 먼저 슬롯을 잡았으면 그걸 기다린다
-  if (next) return afterPending(next, userId, attachments, content, allowCloud);
-  return own(userId, attachments, false).finish(content, allowCloud);
+  if (next) return afterPending(next, userId, attachments, content);
+  return own(userId, attachments, false).finish(content);
 }
 
 /**
  * 메시지를 지우기 전에 호출 — 첨부가 내려가기 전에 다운로드를 시작한다.
- * 반환값의 finish(content, allowCloud) 는 삭제 직후 반드시 호출한다.
- * @returns {{finish: (content:string, allowCloud:boolean) => Promise<{ai:object, buffers:Map<string, Buffer>}>}}
+ * 반환값의 finish(content) 는 삭제 직후 반드시 호출한다.
+ * @returns {{finish: (content:string) => Promise<{ai:object, buffers:Map<string, Buffer>}>}}
  */
 function begin(userId, attachments = []) {
   const pending = inflight.get(userId);
   if (pending) {
-    return { finish: (content, allowCloud) => afterPending(pending, userId, attachments, content, allowCloud) };
+    return { finish: (content) => afterPending(pending, userId, attachments, content) };
   }
   return own(userId, attachments, true);
 }
