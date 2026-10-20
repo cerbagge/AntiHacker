@@ -12,6 +12,7 @@ const guildLogger = require('./guildLogger');
 const guildConfigStore = require('./guildConfigStore');
 const spamSweeper = require('./spamSweeper');
 const sanctionService = require('./sanctionService');
+const honeypotJudge = require('./honeypotJudge');
 const { humanizeDuration } = require('../utils/duration');
 const { tl } = require('./i18n');
 
@@ -202,15 +203,34 @@ async function handleVirusDelete(message, attachment, scan) {
   return alert.id;
 }
 
+/** 함정 채널 AI 판정 → 로그 문구 */
+async function aiVerdictText(ai, lang) {
+  if (ai.verdict === 'unavailable') return tl(lang, 'honeypot.aiUnavailable');
+  const model = ai.model === 'vlm' ? config.OLLAMA_VLM_MODEL : ai.model;
+  const pct = Math.round(ai.confidence * 100);
+  return tl(lang, ai.verdict === 'spam' ? 'honeypot.aiSpam' : 'honeypot.aiClean', { model, pct });
+}
+
 /**
- * 허니팟(스팸 함정) 채널 적발 → 삭제 + 서버 로그 채널.
- * @returns {Promise<number>} alert id
+ * 허니팟(스팸 함정) 채널 적발 → 삭제 + AI 판정 + 서버 로그 채널.
+ * 스팸이거나 AI 판정 불가면 연관 스윕 + 제재, 일반 유저 실수(clean)면 삭제 + 로그만.
+ * @param {{content?:string, attachments?:Array, allowCloud?:boolean}} [input] allowCloud=false → Claude 생략(학습거부 유저)
+ * @returns {Promise<{verdict:'spam'|'clean'|'unavailable', buffers:Map<string, Buffer>}>}
+ *   AI 판정과 미리 받아 둔 첨부 (호출부가 해시 학습 여부를 정한다)
  */
-async function handleHoneypot(message) {
+async function handleHoneypot(message, { content = message.content || '', attachments = [], allowCloud = true } = {}) {
   const lang = guildConfigStore.getLanguage(message.guild?.id);
+
+  // 삭제 전에 판정 슬롯을 잡고 첨부 다운로드를 시작 — 삭제된 메시지의 첨부는 곧 내려간다
+  const judging = honeypotJudge.begin(message.author.id, attachments);
 
   const del = await tryDeleteMessage(message);
   if (!del.deleted) logDeleteFailure('허니팟 메시지', del, message);
+
+  // ── AI 판정 ── 삭제는 이미 했고, 스윕·제재(·호출부의 해시 학습)는 이 판정으로 정한다.
+  // 'clean'(일반 유저 실수)만 봐주고, AI를 못 쓰거나 믿기 어려우면('unavailable') 스팸으로 처리한다.
+  const { ai, buffers } = await judging.finish(content, allowCloud);
+  const punish = ai.verdict !== 'clean';
 
   const alert = alertStore.createAlert({
     guildId: message.guild?.id,
@@ -221,19 +241,23 @@ async function handleHoneypot(message) {
     content: message.content || '',
     dangerPercent: 100,
     breakdown: { A: 0, V: 0, H: 0, P: 0, S: 100 },
-    analysisDetails: { honeypot: true },
+    analysisDetails: { honeypot: true, ai },
   });
 
   logger.warn(`허니팟 적발 ${del.deleted ? '삭제' : '감지(삭제실패)'} #${alert.id}`, {
     author: message.author.tag,
     channel: message.channel.id,
+    ai: ai.verdict,
+    model: ai.model,
+    confidence: ai.confidence,
+    note: ai.note,
   });
 
   // ── 연관 스팸 스윕 ──
   // 허니팟에 걸린 유저는 도배봇으로 본다 → 같은 유저가 비슷한 시간대/내용으로
   // 다른 채널에 뿌린 메시지까지 서버 전역에서 함께 삭제. (실패해도 본 처리에는 영향 없음)
   let sweep = null;
-  if (config.SPAM_SWEEP_ENABLED && message.guild) {
+  if (punish && config.SPAM_SWEEP_ENABLED && message.guild) {
     try {
       sweep = await spamSweeper.sweepRelatedMessages(message, {
         windowMs: config.SPAM_SWEEP_WINDOW_MS,
@@ -268,12 +292,13 @@ async function handleHoneypot(message) {
       value: await tl(lang, 'sweep.summary', { total: sweep.deleted, time: sweep.byTime, content: sweep.byContent, channels: sweep.channels }),
     });
   }
+  embed.addFields({ name: await tl(lang, 'field.aiVerdict'), value: await aiVerdictText(ai, lang) });
   await addDeleteFailureNotice(embed, del, lang);
-  await addSanctionField(embed, message, lang);
+  if (punish) await addSanctionField(embed, message, lang);
 
   await guildLogger.logToGuild(message.client, message.guild?.id, { embeds: [embed] });
 
-  return alert.id;
+  return { verdict: ai.verdict, buffers };
 }
 
 /**

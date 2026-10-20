@@ -1,20 +1,21 @@
 /**
- * Claude 최종 검수 — 코인 스캠 이미지 2차 판정
+ * Claude 최종 검수 — 코인 스캠 이미지 2차 판정 + 스팸 함정 채널 메시지 판정
  *
- * scamImageScanner 의 VLM 단계에서 로컬 VLM보다 먼저 호출된다.
+ * scamImageScanner 의 VLM 단계(analyzeImage)와 honeypotJudge(analyzeHoneypot)에서
+ * 로컬 VLM보다 먼저 호출된다.
  *   1차 CLAUDE_MODEL(기본 Haiku 5.5, 빠르고 쌈) → 판단을 못 하면(거부·미완료·확신도 0.8 미만)
  *   2차 CLAUDE_ESCALATION_MODEL(기본 Sonnet 5.5) 에 다시 묻는다.
  * ANTHROPIC_API_KEY 가 없거나 1차 호출이 API 오류(한도 소진·과부하·인증 등)·타임아웃이면
  * null 을 돌려주고, 호출부가 로컬 VLM(Ollama)으로 전환한다.
  * 오류가 나면 그 모델은 잠시(retry-after, 없으면 400 은 1분·그 외 5분) 호출을 멈춰
  * 이미지마다 실패를 기다리지 않는다.
- * 판정 이유(reason)는 받지 않는다 — 스키마로 {scam, confidence} 만 출력하게 강제.
+ * 판정 이유(reason)는 받지 않는다 — 스키마로 {scam|spam, confidence} 만 출력하게 강제.
  */
 const Anthropic = require('@anthropic-ai/sdk');
 const Jimp = require('jimp');
 const config = require('../config');
 const logger = require('../utils/logger');
-const { PROMPT } = require('./localVlmService');
+const { PROMPT, HONEYPOT_PROMPT } = require('./localVlmService');
 
 // Claude 는 긴 변 1568px 초과 이미지를 서버에서 줄이므로 미리 줄여 업로드량을 아낀다.
 const MAX_SIDE = 1568;
@@ -23,6 +24,8 @@ const DEFAULT_PAUSE_MS = 5 * 60 * 1000;
 const BAD_REQUEST_PAUSE_MS = 60 * 1000;
 // 1차 확신도가 이 미만이면 2차 모델에 묻는다 (스캐너의 삭제 확정 기준과 같은 값)
 const ESCALATE_BELOW = 0.8;
+// 함정 판정에 함께 보내는 이미지 수 상한
+const HONEYPOT_MAX_IMAGES = 3;
 // 거부·미완료·형식 오류 — API 는 정상이지만 판정을 못 받은 경우
 const UNDECIDED = 'undecided';
 
@@ -33,6 +36,16 @@ const SCHEMA = {
     confidence: { type: 'number' },
   },
   required: ['scam', 'confidence'],
+  additionalProperties: false,
+};
+
+const HONEYPOT_SCHEMA = {
+  type: 'object',
+  properties: {
+    spam: { type: 'boolean' },
+    confidence: { type: 'number' },
+  },
+  required: ['spam', 'confidence'],
   additionalProperties: false,
 };
 
@@ -71,8 +84,8 @@ function pauseMsFor(e) {
   return e.status === 400 ? BAD_REQUEST_PAUSE_MS : DEFAULT_PAUSE_MS;
 }
 
-/** 한 모델에 묻는다. → 판정 | UNDECIDED(거부·미완료·형식 오류) | null(API 오류·쉬는 중) */
-async function ask(api, model, jpeg) {
+/** 한 모델에 묻는다. → { o(파싱한 JSON), confidence, model } | UNDECIDED(거부·미완료·형식 오류) | null(API 오류·쉬는 중) */
+async function ask(api, model, content, schema, system) {
   if (Date.now() < (pausedUntil[model] || 0)) return null;
 
   let res;
@@ -80,14 +93,9 @@ async function ask(api, model, jpeg) {
     res = await api.messages.create({
       model,
       max_tokens: 4096,
-      output_config: { effort: 'low', format: { type: 'json_schema', schema: SCHEMA } },
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: jpeg.toString('base64') } },
-          { type: 'text', text: PROMPT },
-        ],
-      }],
+      output_config: { effort: 'low', format: { type: 'json_schema', schema } },
+      ...(system ? { system } : {}),
+      messages: [{ role: 'user', content }],
     });
   } catch (e) {
     const pauseMs = pauseMsFor(e);
@@ -102,15 +110,29 @@ async function ask(api, model, jpeg) {
   }
   try {
     const o = JSON.parse(res.content.find((b) => b.type === 'text')?.text || '');
-    return {
-      scam: o.scam === true,
-      confidence: Math.min(1, Math.max(0, Number(o.confidence) || 0)),
-      model,
-    };
+    return { o, confidence: Math.min(1, Math.max(0, Number(o.confidence) || 0)), model };
   } catch {
     logger.warn('Claude 최종검수 JSON 파싱 실패', { model });
     return UNDECIDED;
   }
+}
+
+/**
+ * 1차 모델 → (판단 못 하면) 2차 모델. → { o, confidence, model } | null(로컬 VLM 사용)
+ */
+async function review(api, content, schema, system) {
+  const first = await ask(api, config.CLAUDE_MODEL, content, schema, system);
+  if (first === null) return null; // API 오류 → 로컬 VLM
+  if (first !== UNDECIDED && first.confidence >= ESCALATE_BELOW) return first;
+
+  // 1차가 판단을 못 함 → 2차 모델. 2차도 못 하면 1차의 애매한 판정, 그것도 없으면 로컬 VLM
+  const second = await ask(api, config.CLAUDE_ESCALATION_MODEL, content, schema, system);
+  if (second && second !== UNDECIDED) return second;
+  return first === UNDECIDED ? null : first;
+}
+
+function imageBlock(jpeg) {
+  return { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: jpeg.toString('base64') } };
 }
 
 /**
@@ -125,14 +147,31 @@ async function analyzeImage(buffer) {
   const jpeg = await toJpeg(buffer);
   if (!jpeg) return null;
 
-  const first = await ask(api, config.CLAUDE_MODEL, jpeg);
-  if (first === null) return null; // API 오류 → 로컬 VLM
-  if (first !== UNDECIDED && first.confidence >= ESCALATE_BELOW) return first;
-
-  // 1차가 판단을 못 함 → 2차 모델. 2차도 못 하면 1차의 애매한 판정, 그것도 없으면 로컬 VLM
-  const second = await ask(api, config.CLAUDE_ESCALATION_MODEL, jpeg);
-  if (second && second !== UNDECIDED) return second;
-  return first === UNDECIDED ? null : first;
+  const r = await review(api, [imageBlock(jpeg), { type: 'text', text: PROMPT }], SCHEMA);
+  return r && { scam: r.o.scam === true, confidence: r.confidence, model: r.model };
 }
 
-module.exports = { analyzeImage };
+/**
+ * 스팸 함정 채널 메시지 판정 (글 + 이미지 최대 HONEYPOT_MAX_IMAGES장).
+ * 판정 기준은 system 지시로, 메시지는 신뢰할 수 없는 데이터로 user 블록에 따로 넣는다(프롬프트 인젝션 격리).
+ * @param {string} text honeypotJudge 가 구분자로 감싼 메시지 설명
+ * @param {Buffer[]} images Jimp 로 읽히는 버퍼 (honeypotJudge 가 변환해 둠)
+ * @returns {Promise<{spam:*,confidence:number,model:string}|null>} null → 로컬 VLM 사용
+ */
+async function analyzeHoneypot(text, images = []) {
+  const api = getClient();
+  if (!api || Date.now() < (pausedUntil[config.CLAUDE_MODEL] || 0)) return null;
+
+  const content = [];
+  for (const buffer of images.slice(0, HONEYPOT_MAX_IMAGES)) {
+    const jpeg = await toJpeg(buffer);
+    if (!jpeg) return null; // 이미지를 못 보낸 채 글만으로 판정하지 않는다 → 로컬 VLM
+    content.push(imageBlock(jpeg));
+  }
+  content.push({ type: 'text', text });
+
+  const r = await review(api, content, HONEYPOT_SCHEMA, HONEYPOT_PROMPT);
+  return r && { spam: r.o.spam, confidence: r.confidence, model: r.model };
+}
+
+module.exports = { analyzeImage, analyzeHoneypot, HONEYPOT_MAX_IMAGES };
