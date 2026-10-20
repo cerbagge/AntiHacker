@@ -39,12 +39,14 @@ module.exports = (client) => {
     if (message.guild) {
       const trapId = guildConfigStore.getSpamChannel(message.guild.id);
       if (trapId && message.channel.id === trapId) {
-        // 삭제 전에 첨부 다운로드를 먼저 시작 — 삭제된 메시지의 첨부는 곧 내려간다
         const { attachments, content } = collect(message);
-        const prefetched = hashGuard.prefetch(attachments);
-        const verdict = await scamResponder.handleHoneypot(message, { content, attachments, prefetched });
-        // AI가 스팸이라고 했을 때만 학습 (AI 판정 불가·일반 글은 학습 안 함)
-        if (verdict === 'spam') hashGuard.learnDeleted(content, attachments, await prefetched);
+        // 학습거부 유저의 글은 Claude(외부)로 보내지 않는다 — 로컬 VLM으로만 판정
+        const allowCloud = !optoutStore.isOptedOut(message.author.id);
+        const { verdict, buffers } = await scamResponder.handleHoneypot(message, { content, attachments, allowCloud });
+        // AI가 스팸이라고 했을 때만 학습 (AI 판정 불가·일반 글은 학습 안 함). 이미지는 받아 둔 것만
+        if (verdict === 'spam') {
+          hashGuard.learnDeleted(content, attachments.filter((a) => buffers.has(a.url)), buffers);
+        }
         return;
       }
     }

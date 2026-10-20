@@ -260,6 +260,12 @@ async function decodeImage(buffer) {
   }
 }
 
+/** Jimp 로 읽히는 버퍼로 변환(움짤은 프레임 이어붙임, webp/avif/heic/svg 등은 PNG). 실패 시 null */
+async function toReadableImage(buffer) {
+  const decoded = await decodeImage(buffer);
+  return decoded ? decoded.buffer : null;
+}
+
 /** scanImage 와 같은 방식으로 256bit dHash 만 계산 (OCR/AI 없음). 실패 시 null */
 async function hashImage(buffer) {
   const decoded = await decodeImage(buffer);
@@ -543,4 +549,4 @@ async function shutdown() {
   }
 }
 
-module.exports = { scanImage, scanMessageImages, downloadAttachment, isImageAttachment, hashImage, shutdown };
+module.exports = { scanImage, scanMessageImages, downloadAttachment, isImageAttachment, hashImage, toReadableImage, shutdown };

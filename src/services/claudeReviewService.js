@@ -24,6 +24,8 @@ const DEFAULT_PAUSE_MS = 5 * 60 * 1000;
 const BAD_REQUEST_PAUSE_MS = 60 * 1000;
 // 1차 확신도가 이 미만이면 2차 모델에 묻는다 (스캐너의 삭제 확정 기준과 같은 값)
 const ESCALATE_BELOW = 0.8;
+// 함정 판정에 함께 보내는 이미지 수 상한
+const HONEYPOT_MAX_IMAGES = 3;
 // 거부·미완료·형식 오류 — API 는 정상이지만 판정을 못 받은 경우
 const UNDECIDED = 'undecided';
 
@@ -83,7 +85,7 @@ function pauseMsFor(e) {
 }
 
 /** 한 모델에 묻는다. → { o(파싱한 JSON), confidence, model } | UNDECIDED(거부·미완료·형식 오류) | null(API 오류·쉬는 중) */
-async function ask(api, model, content, schema) {
+async function ask(api, model, content, schema, system) {
   if (Date.now() < (pausedUntil[model] || 0)) return null;
 
   let res;
@@ -92,6 +94,7 @@ async function ask(api, model, content, schema) {
       model,
       max_tokens: 4096,
       output_config: { effort: 'low', format: { type: 'json_schema', schema } },
+      ...(system ? { system } : {}),
       messages: [{ role: 'user', content }],
     });
   } catch (e) {
@@ -117,13 +120,13 @@ async function ask(api, model, content, schema) {
 /**
  * 1차 모델 → (판단 못 하면) 2차 모델. → { o, confidence, model } | null(로컬 VLM 사용)
  */
-async function review(api, content, schema) {
-  const first = await ask(api, config.CLAUDE_MODEL, content, schema);
+async function review(api, content, schema, system) {
+  const first = await ask(api, config.CLAUDE_MODEL, content, schema, system);
   if (first === null) return null; // API 오류 → 로컬 VLM
   if (first !== UNDECIDED && first.confidence >= ESCALATE_BELOW) return first;
 
   // 1차가 판단을 못 함 → 2차 모델. 2차도 못 하면 1차의 애매한 판정, 그것도 없으면 로컬 VLM
-  const second = await ask(api, config.CLAUDE_ESCALATION_MODEL, content, schema);
+  const second = await ask(api, config.CLAUDE_ESCALATION_MODEL, content, schema, system);
   if (second && second !== UNDECIDED) return second;
   return first === UNDECIDED ? null : first;
 }
@@ -149,24 +152,26 @@ async function analyzeImage(buffer) {
 }
 
 /**
- * 스팸 함정 채널 메시지 판정 (글 + 이미지 최대 3장).
- * @param {string} text HONEYPOT_PROMPT 뒤에 붙일 메시지 설명
- * @param {Buffer[]} images
- * @returns {Promise<{spam:boolean,confidence:number,model:string}|null>} null → 로컬 VLM 사용
+ * 스팸 함정 채널 메시지 판정 (글 + 이미지 최대 HONEYPOT_MAX_IMAGES장).
+ * 판정 기준은 system 지시로, 메시지는 신뢰할 수 없는 데이터로 user 블록에 따로 넣는다(프롬프트 인젝션 격리).
+ * @param {string} text honeypotJudge 가 구분자로 감싼 메시지 설명
+ * @param {Buffer[]} images Jimp 로 읽히는 버퍼 (honeypotJudge 가 변환해 둠)
+ * @returns {Promise<{spam:*,confidence:number,model:string}|null>} null → 로컬 VLM 사용
  */
 async function analyzeHoneypot(text, images = []) {
   const api = getClient();
   if (!api || Date.now() < (pausedUntil[config.CLAUDE_MODEL] || 0)) return null;
 
   const content = [];
-  for (const buffer of images.slice(0, 3)) {
+  for (const buffer of images.slice(0, HONEYPOT_MAX_IMAGES)) {
     const jpeg = await toJpeg(buffer);
-    if (jpeg) content.push(imageBlock(jpeg));
+    if (!jpeg) return null; // 이미지를 못 보낸 채 글만으로 판정하지 않는다 → 로컬 VLM
+    content.push(imageBlock(jpeg));
   }
-  content.push({ type: 'text', text: `${HONEYPOT_PROMPT}\n${text}` });
+  content.push({ type: 'text', text });
 
-  const r = await review(api, content, HONEYPOT_SCHEMA);
-  return r && { spam: r.o.spam === true, confidence: r.confidence, model: r.model };
+  const r = await review(api, content, HONEYPOT_SCHEMA, HONEYPOT_PROMPT);
+  return r && { spam: r.o.spam, confidence: r.confidence, model: r.model };
 }
 
-module.exports = { analyzeImage, analyzeHoneypot };
+module.exports = { analyzeImage, analyzeHoneypot, HONEYPOT_MAX_IMAGES };

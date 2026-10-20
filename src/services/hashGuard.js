@@ -89,12 +89,12 @@ async function learnDeleted(text, attachments = [], prefetched) {
  * @returns {Promise<Map<string, Buffer>>} url -> buffer (실패한 건 빠짐)
  */
 async function prefetch(attachments = []) {
+  const images = hashableImages(attachments);
+  const buffers = await Promise.all(images.map((att) => scamImageScanner.downloadAttachment(att.url)));
+  // 다운로드가 끝난 순서가 아니라 첨부 순서대로 담는다 (AI에는 앞쪽 이미지부터 보낸다)
   const map = new Map();
-  await Promise.all(hashableImages(attachments).map(async (att) => {
-    const buffer = await scamImageScanner.downloadAttachment(att.url);
-    if (buffer) map.set(att.url, buffer);
-  }));
+  images.forEach((att, i) => { if (buffers[i]) map.set(att.url, buffers[i]); });
   return map;
 }
 
-module.exports = { checkKnown, learnDeleted, prefetch };
+module.exports = { checkKnown, learnDeleted, prefetch, hashableImages };
