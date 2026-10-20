@@ -6,7 +6,7 @@
  * 이 스캠은 동일 이미지가 서버마다 반복 게시되므로 가장 싸고 효과적인 1차 필터.
  * 삭제된 메시지의 글 내용도 SHA-256 으로 저장해, 똑같은 글이 다시 올라오면 즉시 지운다.
  *
- * 저장 방식은 기존 optoutStore.js 컨벤션을 따름 (루트에 JSON 파일).
+ * 저장 방식은 다른 저장소(guildConfigStore 등)와 같은 컨벤션을 따름 (루트에 JSON 파일).
  */
 const crypto = require('crypto');
 const fs = require('fs');
