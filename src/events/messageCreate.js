@@ -34,15 +34,17 @@ module.exports = (client) => {
     if (message.author.bot) return;
 
     // ── 허니팟(스팸 함정) 채널 ──
-    // `/spamchannel` 로 지정한 채널에 올라온 메시지는 도배 매크로/스팸봇으로 보고 즉시 처리.
-    // 일반 유저는 이 채널에 글을 쓰지 않으므로(안내), 글이 올라오면 스팸일 확률이 매우 높다.
+    // `/spamchannel` 로 지정한 채널에 올라온 메시지는 즉시 삭제하고, AI 판정으로
+    // 연관 스윕·제재·해시 학습 여부를 정한다 (일반 유저의 실수 글까지 벌하거나 학습하지 않도록).
     if (message.guild) {
       const trapId = guildConfigStore.getSpamChannel(message.guild.id);
       if (trapId && message.channel.id === trapId) {
-        // 삭제 전에 학습(첨부 다운로드)을 먼저 시작 — 삭제된 메시지의 첨부는 곧 내려간다
+        // 삭제 전에 첨부 다운로드를 먼저 시작 — 삭제된 메시지의 첨부는 곧 내려간다
         const { attachments, content } = collect(message);
-        hashGuard.learnDeleted(content, attachments);
-        await scamResponder.handleHoneypot(message);
+        const prefetched = hashGuard.prefetch(attachments);
+        const verdict = await scamResponder.handleHoneypot(message, { content, attachments, prefetched });
+        // AI가 스팸이라고 했을 때만 학습 (AI 판정 불가·일반 글은 학습 안 함)
+        if (verdict === 'spam') hashGuard.learnDeleted(content, attachments, await prefetched);
         return;
       }
     }

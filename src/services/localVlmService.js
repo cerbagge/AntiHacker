@@ -271,4 +271,63 @@ async function analyzeImage(buffer) {
   }
 }
 
-module.exports = { analyzeImage, analyzeDiscordServer, analyzeLinkMessage, isAvailable, PROMPT };
+// 스팸 함정 채널 메시지 판정 — Claude(analyzeHoneypot)와 같은 프롬프트를 쓴다
+const HONEYPOT_PROMPT = [
+  'You are a strict Discord moderation classifier.',
+  'The message below was posted in a SPAM-TRAP channel: members are told NOT to post there,',
+  'so spam bots and hacked accounts that blast every channel are the usual posters.',
+  'Decide whether it is SPAM: unsolicited advertising, scam or phishing lure (crypto, giveaway, fake Nitro,',
+  'casino), server invite / link blast, NSFW bait, account or cheat selling, raid/nuke message,',
+  'or copy-paste gibberish typical of a bot or hacked account.',
+  'It is NOT spam when it looks like a real member\'s mistake: a greeting, a question, a short test',
+  '("test", "ㅎㅇ"), a reply to someone, a normal meme or game screenshot, or asking why the channel exists.',
+  'Judge only from the given text, attachment names and images; do not assume.',
+  'confidence is how sure you are of YOUR ANSWER (spam or not spam), not the probability of spam.',
+  'Respond with ONLY this JSON, nothing else:',
+  '{"spam": true|false, "confidence": 0.0-1.0, "reason": "<short reason>"}',
+].join(' ');
+
+/**
+ * 스팸 함정 채널 메시지를 로컬 VLM으로 판정 (글 + 이미지 1장 — CPU 추론이라 1장만).
+ * @param {string} text HONEYPOT_PROMPT 뒤에 붙일 메시지 설명
+ * @param {Buffer} [image]
+ * @returns {Promise<{spam:boolean,confidence:number,reason:string}|null>} 사용 불가/오류 시 null
+ */
+async function analyzeHoneypot(text, image) {
+  if (!(await isAvailable())) return null;
+
+  try {
+    const body = {
+      model: config.OLLAMA_VLM_MODEL,
+      prompt: `${HONEYPOT_PROMPT}\n${text}`,
+      stream: false,
+      format: 'json',
+      options: { temperature: 0 },
+    };
+    if (image) body.images = [(await shrinkForVlm(image)).toString('base64')];
+
+    const res = await fetch(`${config.OLLAMA_URL}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(config.OLLAMA_TIMEOUT_MS),
+    });
+
+    if (!res.ok) {
+      logger.warn('로컬 VLM 함정 판정 응답 오류', { status: res.status });
+      return null;
+    }
+    const data = await res.json();
+    const parsed = parseServerJson(data.response || '');
+    if (!parsed) logger.warn('로컬 VLM 함정 판정 JSON 파싱 실패', { raw: (data.response || '').slice(0, 200) });
+    return parsed && { spam: parsed.spam, confidence: parsed.confidence, reason: parsed.reason };
+  } catch (e) {
+    logger.warn('로컬 VLM 함정 판정 호출 실패', { error: e.message });
+    availability = { ok: false, checkedAt: Date.now() };
+    return null;
+  }
+}
+
+module.exports = {
+  analyzeImage, analyzeDiscordServer, analyzeLinkMessage, analyzeHoneypot, isAvailable, PROMPT, HONEYPOT_PROMPT,
+};
