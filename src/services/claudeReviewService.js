@@ -12,6 +12,8 @@
  * null 을 돌려주고, 호출부는 AI 없이 진행한다 (로컬 점수·키워드만, 또는 검사 건너뜀 = 통과).
  * 오류가 나면 그 모델은 잠시(retry-after, 없으면 400 은 1분·그 외 5분) 호출을 멈춰
  * 요청마다 실패를 기다리지 않는다.
+ * 모든 기능의 호출이 동시 MAX_CONCURRENT 개 + 대기열 MAX_QUEUE 개를 공유한다 — 한 기능이 몰려 429 가 나면
+ * 공용 모델이 쉬어 다른 기능의 AI 판정까지 멈추므로. 대기열이 차면 그 호출은 null(AI 없이 진행).
  * 출력은 JSON 스키마로 강제한다. 이유(reason)는 기존 로그 형식이 쓰는 초대 가드 판정에서만 받는다.
  */
 const Anthropic = require('@anthropic-ai/sdk');
@@ -29,6 +31,8 @@ const BAD_REQUEST_PAUSE_MS = 60 * 1000;
 const ESCALATE_BELOW = 0.8;
 // 거부·미완료·형식 오류 — API 는 정상이지만 판정을 못 받은 경우
 const UNDECIDED = 'undecided';
+const MAX_CONCURRENT = 4;
+const MAX_QUEUE = 50;
 
 function boolSchema(field) {
   return {
@@ -94,17 +98,37 @@ function pauseMsFor(e) {
   return e.status === 400 ? BAD_REQUEST_PAUSE_MS : DEFAULT_PAUSE_MS;
 }
 
-/** API 호출. → 응답 | null(API 오류·쉬는 중 — 쉬기 처리까지 함) */
+let active = 0;
+const waiters = [];
+
+/** API 호출. → 응답 | null(API 오류·쉬는 중·대기열 가득 — 쉬기 처리까지 함) */
 async function call(api, model, params) {
-  if (Date.now() < (pausedUntil[model] || 0)) return null;
+  if (active >= MAX_CONCURRENT) {
+    if (waiters.length >= MAX_QUEUE) {
+      logger.warn('Claude 호출 대기열 가득 — AI 판정 건너뜀', { active, queued: waiters.length });
+      return null;
+    }
+    await new Promise((resolve) => waiters.push(resolve));
+  }
+  active++;
   try {
+    if (Date.now() < (pausedUntil[model] || 0)) return null; // 기다리는 동안 쉬기가 걸렸을 수 있다
     return await api.messages.create({ model, ...params });
   } catch (e) {
     const pauseMs = pauseMsFor(e);
     if (pauseMs) pausedUntil[model] = Date.now() + pauseMs;
     logger.warn('Claude 호출 실패', { model, status: e.status, error: e.message, pauseSec: Math.round(pauseMs / 1000) });
     return null;
+  } finally {
+    active--;
+    const next = waiters.shift();
+    if (next) next();
   }
+}
+
+/** 지금 Claude 를 쓸 수 있는지 (키 있음 + 1차 모델이 쉬는 중 아님) — 호출 전 준비 작업(다운로드 등)을 아끼는 데 쓴다 */
+function isAvailable() {
+  return getClient() !== null;
 }
 
 /** 한 모델에 JSON 판정을 묻는다. → {...스키마 필드, confidence, model} | UNDECIDED(거부·미완료·형식 오류) | null(API 오류) */
@@ -234,5 +258,6 @@ async function summarizeChat(system, user) {
 }
 
 module.exports = {
+  isAvailable,
   analyzeImage, analyzeText, analyzeAdImage, analyzeDiscordServer, analyzeLinkMessage, judgeChat, summarizeChat,
 };

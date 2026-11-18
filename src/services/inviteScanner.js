@@ -241,15 +241,17 @@ async function analyzeGuildVerdict(guild, logCtx = {}) {
     return { adult: true, spam: false, source: 'nsfwLevel', detail: String(nsfwLevel), confidence: 1 };
   }
 
-  // b) Claude 분석 (키 없음·오류면 null → 키워드만)
+  // b) Claude 분석 (키 없음·오류면 null → 키워드만). 못 쓰면 아이콘도 받지 않는다
   let ai = null;
-  try {
-    let iconBuffer = null;
-    const iconUrl = typeof guild.iconURL === 'function' ? guild.iconURL({ extension: 'png', size: 128 }) : null;
-    if (iconUrl) iconBuffer = await downloadImage(iconUrl);
-    ai = await claudeReviewService.analyzeDiscordServer({ name, description, iconBuffer });
-  } catch (e) {
-    logger.warn('대상 서버 AI 분석 실패', { ...logCtx, error: e.message });
+  if (claudeReviewService.isAvailable()) {
+    try {
+      let iconBuffer = null;
+      const iconUrl = typeof guild.iconURL === 'function' ? guild.iconURL({ extension: 'png', size: 128 }) : null;
+      if (iconUrl) iconBuffer = await downloadImage(iconUrl);
+      ai = await claudeReviewService.analyzeDiscordServer({ name, description, iconBuffer });
+    } catch (e) {
+      logger.warn('대상 서버 AI 분석 실패', { ...logCtx, error: e.message });
+    }
   }
 
   // c) 최종 판정(AI + 키워드 폴백)

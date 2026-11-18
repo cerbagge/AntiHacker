@@ -36,11 +36,7 @@ const ALERT_CONFIDENCE = 0.7;
 // 넘으면 앞·뒤 절반씩 보낸다 — 앞을 평범한 글로 채우고 광고를 뒤에 붙이는 우회 방지.
 const MAX_TEXT_CHARS = 10000;
 const MAX_IMAGES = 4; // 메시지당 AI 에 보일 이미지 수 상한 (비용 보호)
-// Claude 동시 호출 상한·대기열 — 광고가 몰려 429 가 나면 공용 모델이 쉬어 봇의 다른 AI 판정도 멈추므로.
-// 대기열까지 차면 그 메시지의 AI 판정은 건너뛴다(fail-open).
-const MAX_AI_CONCURRENT = 3;
-const MAX_AI_QUEUE = 30;
-// 같은 글 도배는 한 번만 묻는다 (글 판정 결과 캐시)
+// 같은 글 도배는 한 번만 묻는다 (글 판정 결과 캐시). Claude 동시 호출 상한은 claudeReviewService 가 공용으로 건다.
 const TEXT_CACHE_TTL_MS = 10 * 60 * 1000;
 const TEXT_CACHE_MAX = 500;
 
@@ -146,27 +142,6 @@ function findHints(text) {
   return [...hints];
 }
 
-let aiActive = 0;
-const aiWaiters = [];
-/** Claude 호출을 동시성 상한 안에서 실행. 대기열이 가득 차면 null (판정 건너뜀) */
-async function withAiSlot(fn) {
-  if (aiActive >= MAX_AI_CONCURRENT) {
-    if (aiWaiters.length >= MAX_AI_QUEUE) {
-      logger.warn('광고 판정 대기열 가득 — AI 판정 건너뜀', { active: aiActive, queued: aiWaiters.length });
-      return null;
-    }
-    await new Promise((resolve) => aiWaiters.push(resolve));
-  }
-  aiActive++;
-  try {
-    return await fn();
-  } finally {
-    aiActive--;
-    const next = aiWaiters.shift();
-    if (next) next();
-  }
-}
-
 const textCache = new Map(); // 글 → { verdict, at }
 const textInflight = new Map(); // 글 → 진행 중인 판정 Promise (동시에 몰린 같은 글은 한 번만 묻는다)
 
@@ -191,7 +166,7 @@ async function judge(text, authorName) {
   if (hit && Date.now() - hit.at < TEXT_CACHE_TTL_MS) return hit.verdict;
   if (textInflight.has(key)) return textInflight.get(key);
   const pending = (async () => {
-    const verdict = await withAiSlot(() => claudeReviewService.analyzeText(`${PROMPT}\n\n${messageBody(text, authorName)}`));
+    const verdict = await claudeReviewService.analyzeText(`${PROMPT}\n\n${messageBody(text, authorName)}`);
     if (verdict) { // 실패(null)는 캐시하지 않음 — 다음에 다시 묻는다
       if (textCache.size >= TEXT_CACHE_MAX) textCache.delete(textCache.keys().next().value);
       textCache.set(key, { verdict, at: Date.now() });
@@ -216,7 +191,7 @@ function findImageHints(scan) {
  * @returns {Promise<{ad:boolean,confidence:number,model:string}|null>}
  */
 async function judgeImage(scan, text, authorName) {
-  return withAiSlot(() => claudeReviewService.analyzeAdImage(scan.buffer, `${IMAGE_PROMPT}\n\n${messageBody(text, authorName)}`));
+  return claudeReviewService.analyzeAdImage(scan.buffer, `${IMAGE_PROMPT}\n\n${messageBody(text, authorName)}`);
 }
 
 /**
