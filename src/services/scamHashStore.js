@@ -105,6 +105,7 @@ function addAdHash(hash) {
   if (!hash || typeof hash !== 'string') return false;
   if (matchKnownAd(hash, 8)) return false;
   adHashes.push(hash);
+  if (adHashes.length > MAX_ENTRIES) adHashes = adHashes.slice(-MAX_ENTRIES); // 메모리·매칭 비용 상한
   save();
   return true;
 }

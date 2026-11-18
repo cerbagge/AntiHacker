@@ -86,7 +86,7 @@ module.exports = {
     'cmd.sanctionUnbanNote': ', auto-unban after expiry',
     'cmd.sanctionPermanent': 'permanent',
     'cmd.sanctionBadTime': 'Could not read the time "{time}". Use e.g. 4h3m13s — Y(year) M(month) h(hour) m(min) s(sec).',
-    'cmd.adGuardOn': 'Ad guard **on** — invites/links to other Discord servers are deleted, and messages or images with links or lures like "check my profile" / DM / Telegram are checked by AI and deleted if they are ads. Members with Manage Messages are exempt.',
+    'cmd.adGuardOn': 'Ad guard **on** — invites/links to other Discord servers are deleted, and messages or images with links or lures like "check my profile" / DM / Telegram are checked by AI and deleted if they are ads. Staff (admins, Manage Messages) are checked too — their ad posts are deleted but not sanctioned.',
     'cmd.adGuardOff': 'Ad guard **off** — advertising is no longer blocked (scam/NSFW/virus protection stays on).',
     'cmd.adminOnly': 'Only users with the **Administrator** permission can use this command.',
     // 채팅 모더레이터 (실험 기능)
@@ -190,7 +190,7 @@ module.exports = {
     'cmd.sanctionUnbanNote': ', 만료 후 자동 해제',
     'cmd.sanctionPermanent': '영구',
     'cmd.sanctionBadTime': '시간 "{time}" 을(를) 해석할 수 없습니다. 예: 4h3m13s — Y(년) M(월) h(시간) m(분) s(초).',
-    'cmd.adGuardOn': '광고 차단 **켬** — 다른 디스코드 서버 초대·링크는 삭제하고, 링크나 "프로필 확인"·DM·텔레그램 유도 문구가 있는 글·이미지는 AI 가 광고인지 판정해 삭제합니다. 메시지 관리 권한이 있는 멤버는 제외됩니다.',
+    'cmd.adGuardOn': '광고 차단 **켬** — 다른 디스코드 서버 초대·링크는 삭제하고, 링크나 "프로필 확인"·DM·텔레그램 유도 문구가 있는 글·이미지는 AI 가 광고인지 판정해 삭제합니다. 운영진(관리자·메시지 관리 권한)도 검사합니다 — 광고 글은 지우되 제재는 하지 않습니다.',
     'cmd.adGuardOff': '광고 차단 **끔** — 광고는 더 이상 막지 않습니다 (스캠·성인·바이러스 차단은 그대로).',
     'cmd.adminOnly': '**관리자 권한**을 가진 사용자만 이 명령을 사용할 수 있습니다.',
     // 채팅 모더레이터 (실험 기능)

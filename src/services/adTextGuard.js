@@ -277,9 +277,16 @@ async function check(message, text, lang, { images = [], judgeText = true } = {}
   }
   // 신호가 있는 이미지를 먼저 고른 뒤 상한을 적용 (평범한 이미지 4장 뒤에 광고 이미지를 숨기는 우회 방지)
   const hinted = candidates.filter((x) => x.imgHints.length > 0).slice(0, MAX_IMAGES);
+  // 이미지 판정에 맥락으로 주는 글도 이 서버 링크를 뺀다. 이미지 단계(judgeText=false)에선 글 속 초대를
+  // 아직 조회하지 않았으므로 여기서 조회해 캐시를 채운다 (결과는 무시 — 다른 서버 링크 삭제는 글 단계가 한다).
+  let imageContext = ownText;
+  if (hinted.length > 0 && !judgeText && text) {
+    await inviteScanner.findOtherServerLink(message.client, text, message.guild.id);
+    imageContext = inviteScanner.stripOwnDiscordLinks(text, message.guild.id);
+  }
   for (const { scan, imgHints } of hinted) {
     if (best && best.verdict.confidence >= DELETE_CONFIDENCE) break; // 이미 삭제 확정
-    const v = await judgeImage(scan, text, authorName);
+    const v = await judgeImage(scan, imageContext, authorName);
     if (v && v.ad && (!best || v.confidence > best.verdict.confidence)) {
       best = { verdict: v, hints: imgHints.map((h) => `image:${h}`), scan };
     }
