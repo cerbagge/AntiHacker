@@ -103,4 +103,4 @@ async function summarize(lines, category, lang) {
   }
 }
 
-module.exports = { judge, summarize, CATEGORIES };
+module.exports = { judge, summarize, chat, CATEGORIES };

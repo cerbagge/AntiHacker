@@ -1,14 +1,15 @@
 /**
- * Claude 최종 검수 — 코인 스캠 이미지 2차 판정
+ * Claude 최종 검수 — 코인 스캠 이미지 2차 판정 + 광고성 글 판정
  *
- * scamImageScanner 의 VLM 단계에서 로컬 VLM보다 먼저 호출된다.
+ * analyzeImage: scamImageScanner 의 VLM 단계에서 로컬 VLM보다 먼저 호출된다.
+ * analyzeText: adTextGuard 가 링크·우회 유도 문구가 있는 글을 광고인지 물을 때 쓴다.
  *   1차 CLAUDE_MODEL(기본 Haiku 5.5, 빠르고 쌈) → 판단을 못 하면(거부·미완료·확신도 0.8 미만)
  *   2차 CLAUDE_ESCALATION_MODEL(기본 Sonnet 5.5) 에 다시 묻는다.
  * ANTHROPIC_API_KEY 가 없거나 1차 호출이 API 오류(한도 소진·과부하·인증 등)·타임아웃이면
  * null 을 돌려주고, 호출부가 로컬 VLM(Ollama)으로 전환한다.
  * 오류가 나면 그 모델은 잠시(retry-after, 없으면 400 은 1분·그 외 5분) 호출을 멈춰
  * 이미지마다 실패를 기다리지 않는다.
- * 판정 이유(reason)는 받지 않는다 — 스키마로 {scam, confidence} 만 출력하게 강제.
+ * 판정 이유(reason)는 받지 않는다 — 스키마로 {scam|ad, confidence} 만 출력하게 강제.
  */
 const Anthropic = require('@anthropic-ai/sdk');
 const Jimp = require('jimp');
@@ -26,15 +27,17 @@ const ESCALATE_BELOW = 0.8;
 // 거부·미완료·형식 오류 — API 는 정상이지만 판정을 못 받은 경우
 const UNDECIDED = 'undecided';
 
-const SCHEMA = {
-  type: 'object',
-  properties: {
-    scam: { type: 'boolean' },
-    confidence: { type: 'number' },
-  },
-  required: ['scam', 'confidence'],
-  additionalProperties: false,
-};
+function schemaFor(field) {
+  return {
+    type: 'object',
+    properties: {
+      [field]: { type: 'boolean' },
+      confidence: { type: 'number' },
+    },
+    required: [field, 'confidence'],
+    additionalProperties: false,
+  };
+}
 
 let client = null;
 const pausedUntil = {}; // 모델별 — 한 모델의 429 가 다른 모델을 막지 않게
@@ -72,7 +75,7 @@ function pauseMsFor(e) {
 }
 
 /** 한 모델에 묻는다. → 판정 | UNDECIDED(거부·미완료·형식 오류) | null(API 오류·쉬는 중) */
-async function ask(api, model, jpeg) {
+async function ask(api, model, content, field) {
   if (Date.now() < (pausedUntil[model] || 0)) return null;
 
   let res;
@@ -80,14 +83,8 @@ async function ask(api, model, jpeg) {
     res = await api.messages.create({
       model,
       max_tokens: 4096,
-      output_config: { effort: 'low', format: { type: 'json_schema', schema: SCHEMA } },
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: jpeg.toString('base64') } },
-          { type: 'text', text: PROMPT },
-        ],
-      }],
+      output_config: { effort: 'low', format: { type: 'json_schema', schema: schemaFor(field) } },
+      messages: [{ role: 'user', content }],
     });
   } catch (e) {
     const pauseMs = pauseMsFor(e);
@@ -103,7 +100,7 @@ async function ask(api, model, jpeg) {
   try {
     const o = JSON.parse(res.content.find((b) => b.type === 'text')?.text || '');
     return {
-      scam: o.scam === true,
+      [field]: o[field] === true,
       confidence: Math.min(1, Math.max(0, Number(o.confidence) || 0)),
       model,
     };
@@ -125,14 +122,31 @@ async function analyzeImage(buffer) {
   const jpeg = await toJpeg(buffer);
   if (!jpeg) return null;
 
-  const first = await ask(api, config.CLAUDE_MODEL, jpeg);
-  if (first === null) return null; // API 오류 → 로컬 VLM
+  return review(api, [
+    { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: jpeg.toString('base64') } },
+    { type: 'text', text: PROMPT },
+  ], 'scam');
+}
+
+/**
+ * @param {string} prompt 판정 지시 + 메시지 원문 (adTextGuard 가 만든 것)
+ * @returns {Promise<{ad:boolean,confidence:number,model:string}|null>} null → 로컬 LLM 사용
+ */
+async function analyzeText(prompt) {
+  const api = getClient();
+  if (!prompt || !api || Date.now() < (pausedUntil[config.CLAUDE_MODEL] || 0)) return null;
+  return review(api, [{ type: 'text', text: prompt }], 'ad');
+}
+
+/** 1차 모델 → 판단을 못 하면 2차 모델. 둘 다 못 하면 1차의 애매한 판정, 그것도 없으면 null(로컬로) */
+async function review(api, content, field) {
+  const first = await ask(api, config.CLAUDE_MODEL, content, field);
+  if (first === null) return null; // API 오류 → 로컬
   if (first !== UNDECIDED && first.confidence >= ESCALATE_BELOW) return first;
 
-  // 1차가 판단을 못 함 → 2차 모델. 2차도 못 하면 1차의 애매한 판정, 그것도 없으면 로컬 VLM
-  const second = await ask(api, config.CLAUDE_ESCALATION_MODEL, jpeg);
+  const second = await ask(api, config.CLAUDE_ESCALATION_MODEL, content, field);
   if (second && second !== UNDECIDED) return second;
   return first === UNDECIDED ? null : first;
 }
 
-module.exports = { analyzeImage };
+module.exports = { analyzeImage, analyzeText };

@@ -10,6 +10,7 @@ const virusScanner = require('../services/virusScanner');
 const guildConfigStore = require('../services/guildConfigStore');
 const imageQueue = require('../services/imageQueue');
 const chatModerator = require('../services/chatModerator');
+const adTextGuard = require('../services/adTextGuard');
 const hashGuard = require('../services/hashGuard');
 const logger = require('../utils/logger');
 
@@ -147,6 +148,20 @@ module.exports = (client) => {
         }
       }
 
+      // ── 광고성 글 가드 ──
+      // 링크·"프로필 확인"·DM/텔레그램 유도 문구가 있는 글만 AI(Claude → 로컬 LLM)에 광고인지 묻는다.
+      // 확신도 0.9 이상 → 삭제, 0.7 이상 → 아래 관리자 알림에 포함. (유도 문구가 없으면 비용 0으로 통과)
+      let adSuspicious = null;
+      if (hasText) {
+        const adResult = await adTextGuard.check(message, allContent, lang);
+        if (adResult?.autoDelete) {
+          hashGuard.learnDeleted(allContent, allAttachments);
+          await scamResponder.handleScamDelete(message, adResult);
+          return;
+        }
+        if (adResult) adSuspicious = adResult.trigger;
+      }
+
       // ── 로컬 위협 검사 (Gemini 미사용): 링크 피싱 패턴 + 파일 확장자 스캐너 ──
       const collectedLinks = [];
       const collectedFiles = [];
@@ -184,8 +199,8 @@ module.exports = (client) => {
         });
       }
 
-      // 위협(스캠 의심/악성 링크/악성 파일)이 하나도 없으면 종료
-      if (!scamSuspicious && collectedLinks.length === 0 && collectedFiles.length === 0) return;
+      // 위협(스캠 의심/광고 의심/악성 링크/악성 파일)이 하나도 없으면 종료
+      if (!scamSuspicious && !adSuspicious && collectedLinks.length === 0 && collectedFiles.length === 0) return;
 
       // 알림용 이미지 항목 (스캠 의심 1건) — responseHandler 포맷에 맞춰 top-level dangerPercent/reason
       const scamImagesForAlert = scamSuspicious
@@ -199,8 +214,12 @@ module.exports = (client) => {
             reason: scamSuspicious.reason,
           }]
         : [];
+      const adTextForAlert = adSuspicious
+        ? { dangerPercent: adSuspicious.dangerPercent, breakdown: { ...SCAM_BREAKDOWN }, categories: ['S2'], reason: adSuspicious.reason }
+        : null;
 
       const allItems = [
+        ...(adTextForAlert ? [{ d: adTextForAlert.dangerPercent, b: adTextForAlert.breakdown }] : []),
         ...scamImagesForAlert.map((i) => ({ d: i.dangerPercent, b: i.breakdown })),
         ...collectedLinks.map((l) => ({ d: l.dangerPercent, b: l.breakdown })),
         ...collectedFiles.map((f) => ({ d: f.dangerPercent, b: f.breakdown })),
@@ -213,12 +232,13 @@ module.exports = (client) => {
         images: scamImagesForAlert,
         links: collectedLinks,
         files: collectedFiles,
-        text: null,
+        text: adTextForAlert,
       };
       await handleResponse(message, overallDangerPercent, overallBreakdown, analysisDetails);
 
       logger.info(`로컬 검사 완료: ${message.author.tag} | 위험도: ${overallDangerPercent}%`, {
         scamSuspicious: !!scamSuspicious,
+        adSuspicious: !!adSuspicious,
         links: collectedLinks.length,
         files: collectedFiles.length,
       });
