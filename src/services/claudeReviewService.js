@@ -2,7 +2,7 @@
  * Claude 최종 검수 — 코인 스캠 이미지 2차 판정 + 광고성 글 판정
  *
  * analyzeImage: scamImageScanner 의 VLM 단계에서 로컬 VLM보다 먼저 호출된다.
- * analyzeText: adTextGuard 가 링크·우회 유도 문구가 있는 글을 광고인지 물을 때 쓴다.
+ * analyzeText / analyzeAdImage: adTextGuard 가 링크·우회 유도 문구가 있는 글·이미지를 광고인지 물을 때 쓴다.
  *   1차 CLAUDE_MODEL(기본 Haiku 5.5, 빠르고 쌈) → 판단을 못 하면(거부·미완료·확신도 0.8 미만)
  *   2차 CLAUDE_ESCALATION_MODEL(기본 Sonnet 5.5) 에 다시 묻는다.
  * ANTHROPIC_API_KEY 가 없거나 1차 호출이 API 오류(한도 소진·과부하·인증 등)·타임아웃이면
@@ -122,10 +122,27 @@ async function analyzeImage(buffer) {
   const jpeg = await toJpeg(buffer);
   if (!jpeg) return null;
 
-  return review(api, [
+  return review(api, imageContent(jpeg, PROMPT), 'scam');
+}
+
+/**
+ * @param {Buffer} buffer 이미지 버퍼
+ * @param {string} prompt 광고 판정 지시 + 함께 온 메시지 (adTextGuard 가 만든 것)
+ * @returns {Promise<{ad:boolean,confidence:number,model:string}|null>} null → 로컬 LLM 사용
+ */
+async function analyzeAdImage(buffer, prompt) {
+  const api = getClient();
+  if (!buffer || !api || Date.now() < (pausedUntil[config.CLAUDE_MODEL] || 0)) return null;
+  const jpeg = await toJpeg(buffer);
+  if (!jpeg) return null;
+  return review(api, imageContent(jpeg, prompt), 'ad');
+}
+
+function imageContent(jpeg, text) {
+  return [
     { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: jpeg.toString('base64') } },
-    { type: 'text', text: PROMPT },
-  ], 'scam');
+    { type: 'text', text },
+  ];
 }
 
 /**
@@ -149,4 +166,4 @@ async function review(api, content, field) {
   return first === UNDECIDED ? null : first;
 }
 
-module.exports = { analyzeImage, analyzeText };
+module.exports = { analyzeImage, analyzeText, analyzeAdImage };
