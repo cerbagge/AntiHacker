@@ -265,7 +265,8 @@ async function check(message, text, lang, { images = [], judgeText = true } = {}
   const candidates = images.filter((i) => i.buffer).map((scan) => ({ scan, imgHints: findImageHints(scan) }));
   // 원본 OCR 에서 신호가 없던 이미지는 흑백·대비 보정 OCR 로 한 번 더 본다
   // (색 배경 속 어두운 상자의 밝은 글자 — 'discord.gg/…' 같은 — 를 원본 OCR 이 통째로 놓치는 경우). 최대 MAX_IMAGES 장.
-  let reread = 0;
+  // Claude 를 못 쓰면(키 없음·일시정지) 다시 읽어도 쓸 데가 없으므로 건너뛴다.
+  let reread = claudeReviewService.isAvailable() ? 0 : MAX_IMAGES;
   for (const c of candidates) {
     if (c.imgHints.length > 0 || reread >= MAX_IMAGES) continue;
     reread++;
