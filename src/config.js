@@ -19,15 +19,9 @@ module.exports = Object.freeze({
   SCAM_IMAGE_GUARD_ENABLED: process.env.SCAM_IMAGE_GUARD_ENABLED === 'true',
   // 자동삭제 임계값(점수). 이 이상 + 서로 다른 신호 2종류 이상이면 삭제
   SCAM_AUTODELETE_THRESHOLD: parseInt(process.env.SCAM_AUTODELETE_THRESHOLD, 10) || 70,
-  // 로컬 VLM(Ollama) 사용 여부. 'false'로 명시하면 끔 (기본 켬, Ollama 없으면 자동 스킵)
-  SCAM_VLM_ENABLED: process.env.SCAM_VLM_ENABLED !== 'false',
-  // 로컬 VLM(Ollama) 설정
-  OLLAMA_URL: process.env.OLLAMA_URL || 'http://127.0.0.1:11434',
-  OLLAMA_VLM_MODEL: process.env.OLLAMA_VLM_MODEL || 'qwen2.5vl:7b',
-  OLLAMA_TIMEOUT_MS: parseInt(process.env.OLLAMA_TIMEOUT_MS, 10) || 180000,
-  // Claude 최종 검수 — ANTHROPIC_API_KEY 가 있으면 VLM 단계에서 Claude 를 먼저 쓴다.
-  // 1차 CLAUDE_MODEL 이 판단을 못 하면(거부·확신도 0.8 미만) CLAUDE_ESCALATION_MODEL 에 다시 묻고,
-  // API 오류·한도 소진·타임아웃이면 로컬 VLM(Ollama)으로 자동 전환. 키가 없으면 로컬만 사용.
+  // Claude — 봇의 모든 AI 판정(스캠 이미지 최종 검수·초대 가드·광고 가드·채팅 모더레이터). 로컬 모델은 쓰지 않는다.
+  // 1차 CLAUDE_MODEL 이 판단을 못 하면(거부·확신도 0.8 미만) CLAUDE_ESCALATION_MODEL 에 다시 묻는다.
+  // 키가 없거나 API 오류·한도 소진·타임아웃이면 AI 없이 진행 (로컬 점수·키워드만, 나머지 AI 판정은 건너뜀).
   CLAUDE_REVIEW_ENABLED: Boolean(process.env.ANTHROPIC_API_KEY),
   CLAUDE_MODEL: process.env.CLAUDE_MODEL || 'claude-haiku-5-5',
   CLAUDE_ESCALATION_MODEL: process.env.CLAUDE_ESCALATION_MODEL || 'claude-sonnet-5-5',
@@ -56,13 +50,12 @@ module.exports = Object.freeze({
 
   // ── 디스코드 초대 가드 (NSFW/스팸 초대 자동삭제) ──
   // 메시지의 디스코드 링크(초대/채널)를 검사 — 링크 자체로는 차단하지 않고,
-  // ① 초대 대상 서버가 19+(성인)/스팸(공식 nsfwLevel + 로컬 AI + 키워드 폴백)이거나
-  // ② 함께 적힌 문구가 스팸/성인 유인(키워드 + 로컬 AI)일 확률이 높을 때만 삭제. 기본 켬.
+  // ① 초대 대상 서버가 19+(성인)/스팸(공식 nsfwLevel + 키워드, Claude 는 알림만)이거나
+  // ② 함께 적힌 문구가 스팸/성인 유인(키워드, Claude 는 알림만)일 확률이 높을 때만 삭제. 기본 켬.
   INVITE_GUARD_ENABLED: process.env.INVITE_GUARD_ENABLED !== 'false',
 
   // ── 채팅 모더레이터 (실험 기능) ──
-  // experimentalGuilds.json 에 적힌 서버에서만 동작. 판정·요약에 쓸 Ollama 텍스트 모델.
-  CHAT_MOD_MODEL: process.env.CHAT_MOD_MODEL || 'exaone3.5:7.8b',
+  // experimentalGuilds.json 에 적힌 서버에서만 동작. 판정·요약은 Claude (키가 없으면 동작 안 함).
   // 관찰 모드: true 면 삭제·타임아웃·DM 없이 로그만 남긴다 (실험 서버에서 오탐을 먼저 지켜볼 때)
   CHAT_MOD_LOG_ONLY: process.env.CHAT_MOD_LOG_ONLY === 'true',
   // 로그를 받을 유저 ID: 있으면 서버 로그 채널 대신 이 유저 DM으로만 보낸다 (봇과 서버를 하나 이상 공유해야 DM 가능)

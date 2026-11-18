@@ -1,7 +1,7 @@
 /**
  * 초대 가드 드라이런 테스터 (읽기 전용 — 삭제/가입/게이트웨이 접속 없음)
  *
- * 실제 디스코드 API로 초대를 해석하고 실제 로컬 AI(VLM)로 판정만 해서 결과를 출력한다.
+ * 실제 디스코드 API로 초대를 해석하고 실제 AI(Claude)로 판정만 해서 결과를 출력한다.
  * 봇 본체 로직(inviteScanner)을 그대로 태우되, client 는 REST 전용 어댑터로 대체해
  * 게이트웨이 세션을 열지 않는다(=돌아가는 봇과 충돌 없음).
  *
@@ -13,7 +13,6 @@ require('dotenv').config();
 const { REST } = require('discord.js');
 const config = require('../src/config');
 const inviteScanner = require('../src/services/inviteScanner');
-const localVlmService = require('../src/services/localVlmService');
 
 const args = process.argv.slice(2);
 if (args.length === 0) {
@@ -46,8 +45,7 @@ const restClient = {
 };
 
 (async () => {
-  const vlmUp = await localVlmService.isAvailable();
-  console.log(`로컬 AI(VLM): ${vlmUp ? 'ON' : 'OFF(공식등급+키워드만)'}\n`);
+  console.log(`AI(Claude): ${config.CLAUDE_REVIEW_ENABLED ? 'ON' : 'OFF(공식등급+키워드만)'}\n`);
 
   for (const raw of args) {
     // 전체 메시지처럼 넣어도 inviteScanner 가 코드 추출

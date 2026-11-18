@@ -1,17 +1,18 @@
 /**
  * 채팅 모더레이터 (실험 기능) — experimentalGuilds.json 에 적힌 서버에서만 동작
  *
- * 채널별 최근 6줄을 기억해 두고, 새 메시지가 오면 그 6줄 흐름을 로컬 LLM에 보내 마지막 줄을 판정한다.
+ * 채널별 최근 6줄을 기억해 두고, 새 메시지가 오면 그 6줄 흐름을 Claude 에 보내 마지막 줄을 판정한다.
  *  - confidence ≥ 0.9 : 메시지 삭제 + 10분 타임아웃
  *  - 자해·자살은 0.7 이상이면 타임아웃 대신 삭제 + 도움 안내 DM + 관리자에게 돌봄 요청
  *    (처벌이 아니라 안내라서 놓치는 쪽이 더 위험 — 실측에서 "약 다 먹고 끝낼거야"가 0.8로 나옴)
  *  - 그 외 0.7 ≤ conf < 0.9 : 조치 없이 로그에 '의심'으로만 남김
- * 로그 채널에는 원문 대신 LLM 요약 + 참여자 + 처벌 결과만 출력한다. (서버 로그에도 원문을 남기지 않음)
+ * 로그 채널에는 원문 대신 AI 요약 + 참여자 + 처벌 결과만 출력한다. (서버 로그에도 원문을 남기지 않음)
  * CHAT_MOD_LOG_ONLY=true(관찰 모드)면 삭제·타임아웃·DM 없이 '조치했을 판정'을 로그로만 남긴다.
  * CHAT_MOD_LOG_USER_ID 가 있으면 로그를 서버 로그 채널 대신 그 유저(봇 운영자) DM으로만 한국어로 보낸다.
  *
- * LLM은 CPU에서 메시지당 수 초 걸리므로 한 번에 하나씩 순서대로 처리하고, 밀린 메시지가
+ * 판정은 메시지당 1~2초 걸리므로 한 번에 하나씩 순서대로 처리하고, 밀린 메시지가
  * 너무 많으면 새 메시지 검사는 건너뛴다(fail-open). 메시지 처리 흐름(스캠 검사 등)은 막지 않는다.
+ * Claude 키가 없거나 API 오류면 판정이 null 이라 아무 조치도 하지 않는다.
  */
 const { EmbedBuilder } = require('discord.js');
 const config = require('../config');
@@ -93,7 +94,7 @@ async function review(message, window) {
   const dmUserId = config.CHAT_MOD_LOG_USER_ID;
   const logLang = dmUserId ? DM_LOG_LANG : lang;
 
-  // 조치를 먼저 끝내고(빠르게) 요약은 그 뒤에 만든다(요약은 CPU에서 10초 이상 걸릴 수 있음).
+  // 조치를 먼저 끝내고(빠르게) 요약은 그 뒤에 만든다.
   // 로그를 보낼 곳이 없으면 요약을 만들지 않는다(대기열을 오래 붙잡지 않도록).
   const actions = act ? await enforce(message, verdict.category, lang) : null;
   const hasLogTarget = !!dmUserId || !!guildConfigStore.getLogChannel(message.guild.id);

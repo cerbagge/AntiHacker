@@ -1,16 +1,16 @@
 /**
- * 로컬 우선 코인 스캠 이미지 스캐너 (AI 없이도 동작, VLM은 선택적 보강)
+ * 로컬 우선 코인 스캠 이미지 스캐너 (AI 없이도 동작, Claude 는 선택적 보강)
  *
  * 단계 (싼 것 → 비싼 것):
  *   1) pHash       — 알려진 스캠 이미지(해시 일치)면 즉시 차단
  *   2) OCR         — tesseract.js (한국어+영어) 로 이미지 속 글자 추출
  *   3) QR          — jsQR 로 QR 코드 안의 링크 해독
  *   4) 패턴 점수    — cryptoScamPatterns + linkScanner 로 신호 가중 합산
- *   5) 최종 검수    — 점수가 애매하거나 글자가 거의 없을 때만 Claude(설정 시) → 실패하면 로컬 VLM(Ollama)
+ *   5) 최종 검수    — 점수가 애매하거나 글자가 거의 없을 때만 Claude(설정 시). 실패하면 로컬 점수만으로 판정
  *
  * 결과의 dangerPercent / 임계값으로 자동삭제 여부를 정한다. 오삭제를 막기 위해
  * 자동삭제는 "점수 임계값 이상 + 서로 다른 신호 2종류 이상"을 모두 만족해야 한다.
- * VLM은 로컬이 이미 의심한 건을 확정으로 올릴 수만 있고, 로컬 근거 없이 단독으로
+ * AI는 로컬이 이미 의심한 건을 확정으로 올릴 수만 있고, 로컬 근거 없이 단독으로
  * 삭제를 만들지 못한다 (AI 단독 판정 = 의심 → 관리자 알림만).
  */
 const { createWorker } = require('tesseract.js');
@@ -24,7 +24,6 @@ const logger = require('../utils/logger');
 const patterns = require('../constants/cryptoScamPatterns');
 const linkScanner = require('./linkScanner');
 const scamHashStore = require('./scamHashStore');
-const localVlmService = require('./localVlmService');
 const claudeReviewService = require('./claudeReviewService');
 const pdfRenderer = require('./pdfRenderer');
 const { t, DEFAULT_LANG } = require('./i18n');
@@ -420,8 +419,8 @@ async function scanImage(buffer, mimeType, messageText, lang = DEFAULT_LANG) {
   const signals = [...Object.keys(tags)];
   if (tradingWhitelisted) signals.push('trading-whitelist');
 
-  // 5) 로컬 VLM 보강 — 자동삭제는 아니지만 스캠 신호 조합이 있으면 VLM이 눈으로 재확인.
-  //    (순수 양성 이미지 = 신호 0개는 VLM을 부르지 않아 CPU 비용을 묶어둔다.)
+  // 5) Claude 보강 — 자동삭제는 아니지만 스캠 신호 조합이 있으면 Claude 가 눈으로 재확인.
+  //    (순수 양성 이미지 = 신호 0개는 Claude 를 부르지 않아 비용을 묶어둔다.)
   const strongTag = tags.giveaway || tags.wallet || tags.url || tags.casino || tags.celebrity;
   const lowTextHint = ocrText.trim().length < 40 && (tags.crypto || tags.qr);
   const candidate = !autoDelete && (
@@ -439,29 +438,27 @@ async function scanImage(buffer, mimeType, messageText, lang = DEFAULT_LANG) {
   const localCorroborated = tagCount >= 2 && score >= SUSPICIOUS_THRESHOLD;
 
   if (candidate) {
-    // Claude 최종 검수 우선 — 미설정·오류·거부면 null 이 와서 로컬 VLM으로 전환 (판정 기준은 동일)
-    const claude = await claudeReviewService.analyzeImage(buffer);
-    const vlm = claude || await localVlmService.analyzeImage(buffer);
-    const by = claude ? 'claude' : 'vlm';
+    // Claude 최종 검수 — 미설정·오류·거부면 null → 로컬 점수만으로 판정
+    const vlm = await claudeReviewService.analyzeImage(buffer);
     if (vlm) {
-      signals.push(`${claude ? claude.model : 'vlm'}(scam=${vlm.scam},conf=${vlm.confidence.toFixed(2)})`);
+      signals.push(`${vlm.model}(scam=${vlm.scam},conf=${vlm.confidence.toFixed(2)})`);
       if (vlm.scam && vlm.confidence >= 0.8 && localCorroborated && !tradingWhitelisted) {
         autoDelete = true;
         suspicious = true;
         score = Math.max(score, 90);
-        reasons.push(t(lang, `reason.${by}Scam`, { pct: Math.round(vlm.confidence * 100), detail: vlm.reason }));
+        reasons.push(t(lang, 'reason.claudeScam', { pct: Math.round(vlm.confidence * 100) }));
       } else if (vlm.scam && vlm.confidence >= 0.5) {
         // 로컬 뒷받침이 없는 AI 단독 판정 → 삭제·제재 없이 관리자 알림만(의심)
         // 알림 카드는 위험도 26% 이상일 때만 나가므로, 로컬 점수가 낮아도 '의심' 단계(45)로 올린다
         suspicious = true;
         score = Math.max(score, SUSPICIOUS_THRESHOLD);
-        reasons.push(t(lang, `reason.${by}Suspect`, { pct: Math.round(vlm.confidence * 100), detail: vlm.reason }));
+        reasons.push(t(lang, 'reason.claudeSuspect', { pct: Math.round(vlm.confidence * 100) }));
       }
     }
   }
 
   // 삭제 판정된 이미지는 해시로 학습 → 같은 이미지가 다시 오면 OCR/AI 없이 즉시 삭제.
-  // (VLM 확정 삭제도 로컬 신호 2종+점수 45 뒷받침이 있어야만 나오므로 함께 학습)
+  // (AI 확정 삭제도 로컬 신호 2종+점수 45 뒷받침이 있어야만 나오므로 함께 학습)
   if (autoDelete && imgHash && !known) {
     scamHashStore.addScamHash(imgHash);
   }

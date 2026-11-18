@@ -8,4 +8,5 @@ module.exports = [
   require('./language'),
   require('./spamping'),
   require('./spamSanction'),
+  require('./adguard'),
 ];

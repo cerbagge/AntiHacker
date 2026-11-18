@@ -10,6 +10,7 @@ const virusScanner = require('../services/virusScanner');
 const guildConfigStore = require('../services/guildConfigStore');
 const imageQueue = require('../services/imageQueue');
 const chatModerator = require('../services/chatModerator');
+const adTextGuard = require('../services/adTextGuard');
 const hashGuard = require('../services/hashGuard');
 const logger = require('../utils/logger');
 
@@ -51,7 +52,7 @@ module.exports = (client) => {
     if (optoutStore.isOptedOut(message.author.id)) return;
 
     // ── 채팅 모더레이터 (실험 기능, experimentalGuilds.json 서버만) ──
-    // 최근 6줄 흐름을 로컬 LLM이 판정 → 유해하면 삭제 + 10분 타임아웃. 대기열로 따로 돌아서 아래 검사를 막지 않는다.
+    // 최근 6줄 흐름을 Claude 가 판정 → 유해하면 삭제 + 10분 타임아웃. 대기열로 따로 돌아서 아래 검사를 막지 않는다.
     chatModerator.observe(message);
 
     try {
@@ -80,6 +81,7 @@ module.exports = (client) => {
       // 다운로드 전에 슬롯을 잡아, 대기 메시지는 버퍼를 안 들게 한다(메모리=동시처리 수로 고정).
       // 대기열까지 가득 차면 과부하로 보고 검사를 건너뛴다(fail-open).
       let scamSuspicious = null;
+      let adSuspicious = null; // 광고성 글 가드(이미지·글)의 알림 대상 판정
       let slot = false;
       if (allAttachments.length > 0) {
         slot = await imageQueue.acquire();
@@ -127,6 +129,16 @@ module.exports = (client) => {
                 signals: scamSuspicious.signals,
               });
             }
+
+            // ── 광고 이미지 (/adguard on 서버) — 이미지 버퍼를 쓰므로 이 슬롯 안에서 판정 (동시성 상한 유지) ──
+            // 스캐너가 뽑은 OCR 글자·QR 로 1차 필터 → 걸린 이미지만 Claude. 글 판정·글 속 디스코드 링크는 초대 가드 뒤에서 본다.
+            const imageScans = scamResult.scanned.map((s) => s.result).filter(Boolean);
+            const adImage = await adTextGuard.check(message, allContent, lang, { images: imageScans, judgeText: false });
+            if (adImage?.autoDelete) {
+              await scamResponder.handleScamDelete(message, adImage);
+              return;
+            }
+            if (adImage) adSuspicious = adImage.trigger;
           }
         }
       } finally {
@@ -143,7 +155,24 @@ module.exports = (client) => {
         if (inviteVerdict) {
           if (!inviteVerdict.advisory) hashGuard.learnDeleted(allContent, allAttachments); // advisory 는 삭제 안 함
           await scamResponder.handleNsfwInviteDelete(message, inviteVerdict);
-          return; // 삭제 + 로그 완료 → 종료
+          // advisory(알림만)여도 광고 차단(/adguard on) 서버에선 아래 광고성 글 가드가 다른 서버 링크로 지운다
+          if (!inviteVerdict.advisory || !guildConfigStore.getAdGuard(message.guild.id)) return;
+        }
+      }
+
+      // ── 광고성 글 가드 (/adguard on 한 서버만) ──
+      // 다른 서버 디스코드 링크 → 바로 삭제. 링크·"프로필 확인"·DM/텔레그램 유도 문구가 있는 글은 AI(Claude)에
+      // 광고인지 묻는다: 확신도 0.9 이상 → 삭제, 0.7 이상 → 아래 관리자 알림에 포함. (유도 문구가 없으면 비용 0으로 통과)
+      // 이미지 광고는 위 이미지 처리 슬롯 안에서 이미 봤다. 해시 학습은 하지 않는다 — 학습은 전 서버 공통이라,
+      // 광고를 허용하는 서버에서 같은 글이 지워지면 안 된다.
+      if (hasText) {
+        const adResult = await adTextGuard.check(message, allContent, lang);
+        if (adResult?.autoDelete) {
+          await scamResponder.handleScamDelete(message, adResult);
+          return;
+        }
+        if (adResult && (!adSuspicious || adResult.trigger.dangerPercent > adSuspicious.dangerPercent)) {
+          adSuspicious = adResult.trigger;
         }
       }
 
@@ -184,8 +213,8 @@ module.exports = (client) => {
         });
       }
 
-      // 위협(스캠 의심/악성 링크/악성 파일)이 하나도 없으면 종료
-      if (!scamSuspicious && collectedLinks.length === 0 && collectedFiles.length === 0) return;
+      // 위협(스캠 의심/광고 의심/악성 링크/악성 파일)이 하나도 없으면 종료
+      if (!scamSuspicious && !adSuspicious && collectedLinks.length === 0 && collectedFiles.length === 0) return;
 
       // 알림용 이미지 항목 (스캠 의심 1건) — responseHandler 포맷에 맞춰 top-level dangerPercent/reason
       const scamImagesForAlert = scamSuspicious
@@ -199,8 +228,12 @@ module.exports = (client) => {
             reason: scamSuspicious.reason,
           }]
         : [];
+      const adTextForAlert = adSuspicious
+        ? { dangerPercent: adSuspicious.dangerPercent, breakdown: { ...SCAM_BREAKDOWN }, categories: ['S2'], reason: adSuspicious.reason }
+        : null;
 
       const allItems = [
+        ...(adTextForAlert ? [{ d: adTextForAlert.dangerPercent, b: adTextForAlert.breakdown }] : []),
         ...scamImagesForAlert.map((i) => ({ d: i.dangerPercent, b: i.breakdown })),
         ...collectedLinks.map((l) => ({ d: l.dangerPercent, b: l.breakdown })),
         ...collectedFiles.map((f) => ({ d: f.dangerPercent, b: f.breakdown })),
@@ -213,12 +246,13 @@ module.exports = (client) => {
         images: scamImagesForAlert,
         links: collectedLinks,
         files: collectedFiles,
-        text: null,
+        text: adTextForAlert,
       };
       await handleResponse(message, overallDangerPercent, overallBreakdown, analysisDetails);
 
       logger.info(`로컬 검사 완료: ${message.author.tag} | 위험도: ${overallDangerPercent}%`, {
         scamSuspicious: !!scamSuspicious,
+        adSuspicious: !!adSuspicious,
         links: collectedLinks.length,
         files: collectedFiles.length,
       });
