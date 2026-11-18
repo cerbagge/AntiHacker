@@ -36,6 +36,13 @@ const ALERT_CONFIDENCE = 0.7;
 // 넘으면 앞·뒤 절반씩 보낸다 — 앞을 평범한 글로 채우고 광고를 뒤에 붙이는 우회 방지.
 const MAX_TEXT_CHARS = 10000;
 const MAX_IMAGES = 4; // 메시지당 AI 에 보일 이미지 수 상한 (비용 보호)
+// Claude 동시 호출 상한·대기열 — 광고가 몰려 429 가 나면 공용 모델이 쉬어 봇의 다른 AI 판정도 멈추므로.
+// 대기열까지 차면 그 메시지의 AI 판정은 건너뛴다(fail-open).
+const MAX_AI_CONCURRENT = 3;
+const MAX_AI_QUEUE = 30;
+// 같은 글 도배는 한 번만 묻는다 (글 판정 결과 캐시)
+const TEXT_CACHE_TTL_MS = 10 * 60 * 1000;
+const TEXT_CACHE_MAX = 500;
 
 // URL 이 있어도 AI 에 묻지 않는 도메인 (linkScanner 안전 도메인에 더해)
 //  - 디스코드 자체 링크·첨부 CDN·니트로 선물 (다른 서버 초대·채널 링크는 위 0) 단계가 따로 잡는다)
@@ -44,9 +51,11 @@ const IGNORED_URL_DOMAINS = [
   'discord.gg', 'discord.com', 'discordapp.com', 'discordapp.net', 'discord.media', 'discord.gift',
   'tenor.com', 'tenor.co', 'giphy.com', 'klipy.com', 'imgur.com',
 ];
-// http 없이 적힌 무시 도메인 (discord.gg/abc 처럼) — 맨 도메인 신호로 다시 잡히지 않게 지운다
+// http 없이 적힌 무시 도메인 (discord.gg/abc 처럼) — 맨 도메인 신호로 다시 잡히지 않게 지운다.
+// 호스트 이름 경계를 확인한다: discord.com.evil.com, evildiscord.com 같은 외부 도메인은 지우지 않는다.
 const BARE_IGNORED = new RegExp(
-  `(?:[a-z0-9-]+\\.)*(?:${IGNORED_URL_DOMAINS.map((d) => d.replace(/\./g, '\\.')).join('|')})\\S*`, 'g',
+  `(?<![a-z0-9.-])(?:[a-z0-9-]+\\.)*(?:${IGNORED_URL_DOMAINS.map((d) => d.replace(/\./g, '\\.')).join('|')})`
+  + `(?![a-z0-9-]|\\.[a-z0-9])\\S*`, 'g',
 );
 
 // 공백·기호를 지운 소문자 글에서 찾는 문구
@@ -137,6 +146,30 @@ function findHints(text) {
   return [...hints];
 }
 
+let aiActive = 0;
+const aiWaiters = [];
+/** Claude 호출을 동시성 상한 안에서 실행. 대기열이 가득 차면 null (판정 건너뜀) */
+async function withAiSlot(fn) {
+  if (aiActive >= MAX_AI_CONCURRENT) {
+    if (aiWaiters.length >= MAX_AI_QUEUE) {
+      logger.warn('광고 판정 대기열 가득 — AI 판정 건너뜀', { active: aiActive, queued: aiWaiters.length });
+      return null;
+    }
+    await new Promise((resolve) => aiWaiters.push(resolve));
+  }
+  aiActive++;
+  try {
+    return await fn();
+  } finally {
+    aiActive--;
+    const next = aiWaiters.shift();
+    if (next) next();
+  }
+}
+
+const textCache = new Map(); // 글 → { verdict, at }
+const textInflight = new Map(); // 글 → 진행 중인 판정 Promise (동시에 몰린 같은 글은 한 번만 묻는다)
+
 function clip(text) {
   if (text.length <= MAX_TEXT_CHARS) return text;
   const half = MAX_TEXT_CHARS / 2;
@@ -153,7 +186,20 @@ function messageBody(text, authorName) {
  * @returns {Promise<{ad:boolean,confidence:number,model:string}|null>} null → 판정 실패(통과)
  */
 async function judge(text, authorName) {
-  return claudeReviewService.analyzeText(`${PROMPT}\n\n${messageBody(text, authorName)}`);
+  const key = text.trim();
+  const hit = textCache.get(key);
+  if (hit && Date.now() - hit.at < TEXT_CACHE_TTL_MS) return hit.verdict;
+  if (textInflight.has(key)) return textInflight.get(key);
+  const pending = (async () => {
+    const verdict = await withAiSlot(() => claudeReviewService.analyzeText(`${PROMPT}\n\n${messageBody(text, authorName)}`));
+    if (verdict) { // 실패(null)는 캐시하지 않음 — 다음에 다시 묻는다
+      if (textCache.size >= TEXT_CACHE_MAX) textCache.delete(textCache.keys().next().value);
+      textCache.set(key, { verdict, at: Date.now() });
+    }
+    return verdict;
+  })().finally(() => textInflight.delete(key));
+  textInflight.set(key, pending);
+  return pending;
 }
 
 /** 이미지 1차 필터 — OCR 글자 + QR 링크. 글자로 적힌 디스코드 초대도 신호로 본다(텍스트 필터는 지워 버리므로) */
@@ -170,7 +216,7 @@ function findImageHints(scan) {
  * @returns {Promise<{ad:boolean,confidence:number,model:string}|null>}
  */
 async function judgeImage(scan, text, authorName) {
-  return claudeReviewService.analyzeAdImage(scan.buffer, `${IMAGE_PROMPT}\n\n${messageBody(text, authorName)}`);
+  return withAiSlot(() => claudeReviewService.analyzeAdImage(scan.buffer, `${IMAGE_PROMPT}\n\n${messageBody(text, authorName)}`));
 }
 
 /**
@@ -212,10 +258,14 @@ async function check(message, text, lang, { images = [], judgeText = true } = {}
     const v = await judge(text, authorName);
     if (v && v.ad) best = { verdict: v, hints };
   }
-  for (const scan of images.filter((i) => i.buffer).slice(0, MAX_IMAGES)) {
+  // 신호가 있는 이미지를 먼저 고른 뒤 상한을 적용 (평범한 이미지 4장 뒤에 광고 이미지를 숨기는 우회 방지)
+  const hinted = images
+    .filter((i) => i.buffer)
+    .map((scan) => ({ scan, imgHints: findImageHints(scan) }))
+    .filter((x) => x.imgHints.length > 0)
+    .slice(0, MAX_IMAGES);
+  for (const { scan, imgHints } of hinted) {
     if (best && best.verdict.confidence >= DELETE_CONFIDENCE) break; // 이미 삭제 확정
-    const imgHints = findImageHints(scan);
-    if (imgHints.length === 0) continue;
     const v = await judgeImage(scan, text, authorName);
     if (v && v.ad && (!best || v.confidence > best.verdict.confidence)) {
       best = { verdict: v, hints: imgHints.map((h) => `image:${h}`), scan };
