@@ -32,7 +32,9 @@ const { t } = require('./i18n');
 
 const DELETE_CONFIDENCE = 0.9;
 const ALERT_CONFIDENCE = 0.7;
-const MAX_TEXT_CHARS = 1500;
+// AI 에 보내는 글 상한. 디스코드 글은 최대 4000자(+전달 메시지)라 보통 전부 들어간다.
+// 넘으면 앞·뒤 절반씩 보낸다 — 앞을 평범한 글로 채우고 광고를 뒤에 붙이는 우회 방지.
+const MAX_TEXT_CHARS = 10000;
 const MAX_IMAGES = 4; // 메시지당 AI 에 보일 이미지 수 상한 (비용 보호)
 
 // URL 이 있어도 AI 에 묻지 않는 도메인 (linkScanner 안전 도메인에 더해)
@@ -124,8 +126,14 @@ function findHints(text) {
   return [...hints];
 }
 
+function clip(text) {
+  if (text.length <= MAX_TEXT_CHARS) return text;
+  const half = MAX_TEXT_CHARS / 2;
+  return `${text.slice(0, half)}\n…(중략)…\n${text.slice(-half)}`;
+}
+
 function messageBody(text, authorName) {
-  return `[보낸 사람 닉네임] ${authorName || '(알 수 없음)'}\n[메시지]\n<<<\n${(text || '(없음)').slice(0, MAX_TEXT_CHARS)}\n>>>`;
+  return `[보낸 사람 닉네임] ${authorName || '(알 수 없음)'}\n[메시지]\n<<<\n${clip(text || '(없음)')}\n>>>`;
 }
 
 /**
