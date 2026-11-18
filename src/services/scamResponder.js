@@ -116,9 +116,11 @@ async function buildScamEmbed(message, trigger, del, lang) {
 
 /**
  * 고신뢰 코인 스캠 이미지 → 삭제 + 서버 로그 채널.
+ * @param {object} [opts]
+ * @param {boolean} [opts.sanction=true] false 면 /spamsanction 제재 없이 삭제만 (광고 가드의 운영진 글)
  * @returns {Promise<number>} alert id
  */
-async function handleScamDelete(message, scanResult) {
+async function handleScamDelete(message, scanResult, { sanction = true } = {}) {
   const trigger = scanResult.trigger;
   const lang = guildConfigStore.getLanguage(message.guild?.id);
 
@@ -146,7 +148,7 @@ async function handleScamDelete(message, scanResult) {
   });
 
   const embed = await buildScamEmbed(message, trigger, del, lang);
-  await addSanctionField(embed, message, lang);
+  if (sanction) await addSanctionField(embed, message, lang);
   // 첨부는 전송할 때마다 새로 생성(스트림 재사용 문제 방지)
   const makeFiles = () =>
     trigger.buffer ? [new AttachmentBuilder(trigger.buffer, { name: `scam_${trigger.attachmentName || 'image'}` })] : [];

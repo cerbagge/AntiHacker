@@ -19,15 +19,19 @@
  * 2차 판정: Claude(1차 CLAUDE_MODEL → 애매하면 CLAUDE_ESCALATION_MODEL).
  *   키 없음·API 오류·한도 소진이면 AI 판정은 건너뛴다(통과, fail-open). 다른 서버 디스코드 링크 삭제는 AI 와 무관하게 동작.
  *   confidence ≥ 0.9 → 삭제, 0.7 ≤ confidence < 0.9 → 관리자 알림, 그 외 통과.
- * 메시지 관리 권한(ManageMessages)이 있는 멤버는 검사하지 않는다 (공지·이벤트·파트너 링크).
- * 삭제해도 전역 해시 학습은 하지 않는다 — 광고를 허용하는 서버에서 같은 글이 지워지면 안 되므로.
+ * 관리자·메시지 관리 권한이 있는 멤버도 검사한다 — 광고 가드를 켠 서버는 누구의 광고도 받지 않는다.
+ *   단 운영진은 글만 지우고 /spamsanction 제재는 하지 않는다 (AI 오판 한 번에 운영진이 밴되지 않게).
+ * 이미지 광고로 삭제하면 그 이미지 해시를 '광고 해시'로 학습한다 — 스캠 해시와 따로 저장하고,
+ *   광고 가드를 켠 서버에서만 매칭해 AI 없이 바로 지운다 (광고를 허용하는 서버에선 지우지 않음).
  */
-const { PermissionsBitField } = require('discord.js');
 const logger = require('../utils/logger');
 const linkScanner = require('./linkScanner');
 const inviteScanner = require('./inviteScanner');
 const guildConfigStore = require('./guildConfigStore');
+const { PermissionsBitField } = require('discord.js');
 const claudeReviewService = require('./claudeReviewService');
+const scamImageScanner = require('./scamImageScanner');
+const scamHashStore = require('./scamHashStore');
 const { t } = require('./i18n');
 
 const DELETE_CONFIDENCE = 0.9;
@@ -202,12 +206,13 @@ async function judgeImage(scan, text, authorName) {
  * @param {Array<{buffer:Buffer, ocrText?:string, qrUrl?:string, attachmentName?:string}>} [opts.images] 스캠 이미지 스캐너 결과
  * @param {boolean} [opts.judgeText=true] false 면 글은 이미지 판정의 맥락으로만 쓰고, 글 판정·글 속 디스코드 링크 검사는 하지 않는다
  *   (messageCreate 가 이미지 처리 슬롯 안에서 이미지만 먼저 보고, 글은 초대 가드 뒤에서 따로 본다)
- * @returns {Promise<null | {autoDelete:boolean, suspicious:true, trigger:object}>}
+ * @returns {Promise<null | {autoDelete:boolean, suspicious:true, sanction:boolean, trigger:object}>}
  *   autoDelete 면 scamResponder.handleScamDelete 에 그대로 넘기고, 아니면 trigger 로 관리자 알림.
+ *   sanction=false 면 운영진 글 — 삭제만 하고 /spamsanction 제재는 하지 않는다.
  */
 async function check(message, text, lang, { images = [], judgeText = true } = {}) {
   if (!message.guild || !guildConfigStore.getAdGuard(message.guild.id)) return null;
-  if (message.member?.permissions?.has(PermissionsBitField.Flags.ManageMessages)) return null;
+  const sanction = !message.member?.permissions?.has(PermissionsBitField.Flags.ManageMessages); // 운영진은 삭제만
 
   const qrText = images.map((i) => i.qrUrl).filter(Boolean).join('\n');
   const linkText = judgeText ? `${text || ''}\n${qrText}` : qrText;
@@ -217,6 +222,7 @@ async function check(message, text, lang, { images = [], judgeText = true } = {}
     return {
       autoDelete: true,
       suspicious: true,
+      sanction,
       trigger: {
         dangerPercent: 100,
         confidence: 1,
@@ -227,20 +233,50 @@ async function check(message, text, lang, { images = [], judgeText = true } = {}
     };
   }
 
+  // 광고 가드가 지운 적 있는 이미지 → AI 없이 바로 삭제
+  const knownAd = images.find((i) => i.phash && scamHashStore.matchKnownAd(i.phash));
+  if (knownAd) {
+    logger.info('광고성 이미지 삭제 대상 (알려진 광고 이미지)', { author: message.author.tag });
+    return {
+      autoDelete: true,
+      suspicious: true,
+      sanction,
+      trigger: {
+        dangerPercent: 100,
+        confidence: 1,
+        reason: t(lang, 'reason.adKnownHash'),
+        signals: ['known-ad-hash'],
+        source: 'phash',
+        ...(knownAd.buffer ? { buffer: knownAd.buffer, attachmentName: knownAd.attachmentName } : {}),
+      },
+    };
+  }
+
   const authorName = message.member?.displayName || message.author.globalName || message.author.username;
   let best = null; // { verdict, hints, scan? }
 
-  const hints = judgeText ? findHints(text) : [];
+  // 이 서버로 확인된 디스코드 링크는 빼고 판정 (관리자 공지의 자기 서버 초대가 광고로 오판되지 않게)
+  const ownText = judgeText ? inviteScanner.stripOwnDiscordLinks(text, message.guild.id) : '';
+  const hints = judgeText ? findHints(ownText) : [];
   if (hints.length > 0) {
-    const v = await judge(text, authorName);
+    const v = await judge(ownText, authorName);
     if (v && v.ad) best = { verdict: v, hints };
   }
+  const candidates = images.filter((i) => i.buffer).map((scan) => ({ scan, imgHints: findImageHints(scan) }));
+  // 원본 OCR 에서 신호가 없던 이미지는 흑백·대비 보정 OCR 로 한 번 더 본다
+  // (색 배경 속 어두운 상자의 밝은 글자 — 'discord.gg/…' 같은 — 를 원본 OCR 이 통째로 놓치는 경우). 최대 MAX_IMAGES 장.
+  let reread = 0;
+  for (const c of candidates) {
+    if (c.imgHints.length > 0 || reread >= MAX_IMAGES) continue;
+    reread++;
+    const more = await scamImageScanner.ocrEnhanced(c.scan.buffer);
+    if (!more.trim()) continue;
+    const scan = { ...c.scan, ocrText: `${c.scan.ocrText || ''}\n${more}` };
+    const imgHints = findImageHints(scan);
+    if (imgHints.length > 0) Object.assign(c, { scan, imgHints });
+  }
   // 신호가 있는 이미지를 먼저 고른 뒤 상한을 적용 (평범한 이미지 4장 뒤에 광고 이미지를 숨기는 우회 방지)
-  const hinted = images
-    .filter((i) => i.buffer)
-    .map((scan) => ({ scan, imgHints: findImageHints(scan) }))
-    .filter((x) => x.imgHints.length > 0)
-    .slice(0, MAX_IMAGES);
+  const hinted = candidates.filter((x) => x.imgHints.length > 0).slice(0, MAX_IMAGES);
   for (const { scan, imgHints } of hinted) {
     if (best && best.verdict.confidence >= DELETE_CONFIDENCE) break; // 이미 삭제 확정
     const v = await judgeImage(scan, text, authorName);
@@ -253,6 +289,7 @@ async function check(message, text, lang, { images = [], judgeText = true } = {}
   const { verdict, scan } = best;
   const pct = Math.round(verdict.confidence * 100);
   const autoDelete = verdict.confidence >= DELETE_CONFIDENCE;
+  if (autoDelete && scan?.phash) scamHashStore.addAdHash(scan.phash); // 다음엔 AI 없이 바로 삭제
   logger.info(`광고성 ${scan ? '이미지' : '글'} ${autoDelete ? '삭제 대상' : '의심 → 관리자 알림'}`, {
     author: message.author.tag,
     confidence: verdict.confidence,
@@ -262,6 +299,7 @@ async function check(message, text, lang, { images = [], judgeText = true } = {}
   return {
     autoDelete,
     suspicious: true,
+    sanction,
     trigger: {
       dangerPercent: pct,
       confidence: verdict.confidence,
