@@ -84,4 +84,17 @@ async function learnDeleted(text, attachments = [], prefetched) {
   }
 }
 
-module.exports = { checkKnown, learnDeleted };
+/**
+ * 해시 대상 이미지를 미리 받아 둔다(메시지를 지우면 첨부가 곧 내려가므로 삭제 전에 시작).
+ * @returns {Promise<Map<string, Buffer>>} url -> buffer (실패한 건 빠짐)
+ */
+async function prefetch(attachments = []) {
+  const images = hashableImages(attachments);
+  const buffers = await Promise.all(images.map((att) => scamImageScanner.downloadAttachment(att.url)));
+  // 다운로드가 끝난 순서가 아니라 첨부 순서대로 담는다 (AI에는 앞쪽 이미지부터 보낸다)
+  const map = new Map();
+  images.forEach((att, i) => { if (buffers[i]) map.set(att.url, buffers[i]); });
+  return map;
+}
+
+module.exports = { checkKnown, learnDeleted, prefetch, hashableImages };

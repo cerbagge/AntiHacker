@@ -5,6 +5,7 @@
  * analyzeText / analyzeAdImage: 광고성 글·이미지 판정 (adTextGuard)
  * analyzeDiscordServer / analyzeLinkMessage: 초대 대상 서버·링크 동반 문구 판정 (inviteScanner)
  * judgeChat / summarizeChat: 채팅 모더레이터 판정·로그 요약 (chatSafetyService)
+ * analyzeHoneypot: 스팸 함정 채널 메시지 판정 (honeypotJudge)
  *
  *   판정은 1차 CLAUDE_MODEL(기본 Haiku 5.5, 빠르고 쌈) → 판단을 못 하면(거부·미완료·확신도 0.8 미만)
  *   2차 CLAUDE_ESCALATION_MODEL(기본 Sonnet 5.5) 에 다시 묻는다. 요약은 1차 모델만 쓴다.
@@ -21,7 +22,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 const Jimp = require('jimp');
 const config = require('../config');
 const logger = require('../utils/logger');
-const { PROMPT, SERVER_PROMPT, LINK_MESSAGE_PROMPT } = require('../constants/aiPrompts');
+const { PROMPT, SERVER_PROMPT, LINK_MESSAGE_PROMPT, HONEYPOT_PROMPT } = require('../constants/aiPrompts');
 
 // Claude 는 긴 변 1568px 초과 이미지를 서버에서 줄이므로 미리 줄여 업로드량을 아낀다.
 const MAX_SIDE = 1568;
@@ -34,6 +35,8 @@ const ESCALATE_BELOW = 0.8;
 const UNDECIDED = 'undecided';
 const MAX_CONCURRENT = 4;
 const MAX_QUEUE = 50;
+// 함정 판정에 함께 보내는 이미지 수 상한
+const HONEYPOT_MAX_IMAGES = 3;
 
 function boolSchema(field) {
   return {
@@ -228,6 +231,25 @@ async function analyzeLinkMessage({ content } = {}) {
 }
 
 /**
+ * 스팸 함정 채널 메시지 판정 (글 + 이미지 최대 HONEYPOT_MAX_IMAGES장).
+ * @param {string} body honeypotJudge 가 구분자로 감싼 메시지 설명
+ * @param {Buffer[]} images Jimp 로 읽히는 버퍼 (honeypotJudge 가 변환해 둠)
+ * @returns {Promise<{spam:boolean,confidence:number,model:string}|null>} null → 판정 불가
+ */
+async function analyzeHoneypot(body, images = []) {
+  const api = getClient();
+  if (!body || !api) return null;
+  const content = [];
+  for (const buffer of images.slice(0, HONEYPOT_MAX_IMAGES)) {
+    const jpeg = await toJpeg(buffer);
+    if (!jpeg) return null; // 이미지를 못 보낸 채 글만으로 판정하지 않는다
+    content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: jpeg.toString('base64') } });
+  }
+  content.push({ type: 'text', text: body });
+  return review(api, HONEYPOT_PROMPT, content, boolSchema('spam'));
+}
+
+/**
  * 채팅 모더레이터 판정.
  * @param {string} system 판정 지시
  * @param {string} transcript 대화 (chatSafetyService 가 만든 것)
@@ -265,4 +287,5 @@ async function summarizeChat(system, user) {
 module.exports = {
   isAvailable,
   analyzeImage, analyzeText, analyzeAdImage, analyzeDiscordServer, analyzeLinkMessage, judgeChat, summarizeChat,
+  analyzeHoneypot, HONEYPOT_MAX_IMAGES,
 };
