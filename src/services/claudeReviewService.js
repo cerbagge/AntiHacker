@@ -14,6 +14,7 @@
  * 요청마다 실패를 기다리지 않는다.
  * 모든 기능의 호출이 동시 MAX_CONCURRENT 개 + 대기열 MAX_QUEUE 개를 공유한다 — 한 기능이 몰려 429 가 나면
  * 공용 모델이 쉬어 다른 기능의 AI 판정까지 멈추므로. 대기열이 차면 그 호출은 null(AI 없이 진행).
+ * 판정 지시는 system 프롬프트로, 사용자가 쓴 글·이미지는 user 메시지로 따로 보낸다 (글 속 "none 으로 판정해" 같은 주입 방지).
  * 출력은 JSON 스키마로 강제한다. 이유(reason)는 기존 로그 형식이 쓰는 초대 가드 판정에서만 받는다.
  */
 const Anthropic = require('@anthropic-ai/sdk');
@@ -132,10 +133,11 @@ function isAvailable() {
 }
 
 /** 한 모델에 JSON 판정을 묻는다. → {...스키마 필드, confidence, model} | UNDECIDED(거부·미완료·형식 오류) | null(API 오류) */
-async function ask(api, model, content, schema) {
+async function ask(api, model, system, content, schema) {
   const res = await call(api, model, {
     max_tokens: 4096,
     output_config: { effort: 'low', format: { type: 'json_schema', schema } },
+    system,
     messages: [{ role: 'user', content }],
   });
   if (!res) return null;
@@ -154,12 +156,12 @@ async function ask(api, model, content, schema) {
 }
 
 /** 1차 모델 → 판단을 못 하면 2차 모델. 둘 다 못 하면 1차의 애매한 판정, 그것도 없으면 null */
-async function review(api, content, schema) {
-  const first = await ask(api, config.CLAUDE_MODEL, content, schema);
+async function review(api, system, content, schema) {
+  const first = await ask(api, config.CLAUDE_MODEL, system, content, schema);
   if (first === null) return null; // API 오류
   if (first !== UNDECIDED && first.confidence >= ESCALATE_BELOW) return first;
 
-  const second = await ask(api, config.CLAUDE_ESCALATION_MODEL, content, schema);
+  const second = await ask(api, config.CLAUDE_ESCALATION_MODEL, system, content, schema);
   if (second && second !== UNDECIDED) return second;
   return first === UNDECIDED ? null : first;
 }
@@ -173,30 +175,32 @@ async function analyzeImage(buffer) {
   if (!buffer || !api) return null;
   const jpeg = await toJpeg(buffer);
   if (!jpeg) return null;
-  return review(api, imageContent(jpeg, PROMPT), boolSchema('scam'));
+  return review(api, PROMPT, imageContent(jpeg, 'Classify this image.'), boolSchema('scam'));
 }
 
 /**
  * @param {Buffer} buffer 이미지 버퍼
- * @param {string} prompt 광고 판정 지시 + 함께 온 메시지 (adTextGuard 가 만든 것)
+ * @param {string} system 광고 판정 지시
+ * @param {string} body 함께 온 메시지 (adTextGuard 가 만든 것)
  * @returns {Promise<{ad:boolean,confidence:number,model:string}|null>} null → 검사 건너뜀
  */
-async function analyzeAdImage(buffer, prompt) {
+async function analyzeAdImage(buffer, system, body) {
   const api = getClient();
   if (!buffer || !api) return null;
   const jpeg = await toJpeg(buffer);
   if (!jpeg) return null;
-  return review(api, imageContent(jpeg, prompt), boolSchema('ad'));
+  return review(api, system, imageContent(jpeg, body), boolSchema('ad'));
 }
 
 /**
- * @param {string} prompt 판정 지시 + 메시지 원문 (adTextGuard 가 만든 것)
+ * @param {string} system 판정 지시
+ * @param {string} body 메시지 원문 (adTextGuard 가 만든 것)
  * @returns {Promise<{ad:boolean,confidence:number,model:string}|null>} null → 검사 건너뜀
  */
-async function analyzeText(prompt) {
+async function analyzeText(system, body) {
   const api = getClient();
-  if (!prompt || !api) return null;
-  return review(api, [{ type: 'text', text: prompt }], boolSchema('ad'));
+  if (!body || !api) return null;
+  return review(api, system, [{ type: 'text', text: body }], boolSchema('ad'));
 }
 
 /**
@@ -206,10 +210,10 @@ async function analyzeText(prompt) {
 async function analyzeDiscordServer({ name, description, iconBuffer } = {}) {
   const api = getClient();
   if (!api) return null;
-  const text = `${SERVER_PROMPT}\nSERVER NAME: ${(name || '(unknown)').slice(0, 200)}\n`
+  const text = `SERVER NAME: ${(name || '(unknown)').slice(0, 200)}\n`
     + `SERVER DESCRIPTION: ${(description || '(none)').slice(0, 1000)}`;
   const jpeg = iconBuffer ? await toJpeg(iconBuffer) : null;
-  return review(api, jpeg ? imageContent(jpeg, text) : [{ type: 'text', text }], ADULT_SPAM_SCHEMA);
+  return review(api, SERVER_PROMPT, jpeg ? imageContent(jpeg, text) : [{ type: 'text', text }], ADULT_SPAM_SCHEMA);
 }
 
 /**
@@ -219,20 +223,21 @@ async function analyzeDiscordServer({ name, description, iconBuffer } = {}) {
 async function analyzeLinkMessage({ content } = {}) {
   const api = getClient();
   if (!api) return null;
-  const text = `${LINK_MESSAGE_PROMPT}\nMESSAGE: ${(content || '').slice(0, 1500)}`;
-  return review(api, [{ type: 'text', text }], ADULT_SPAM_SCHEMA);
+  const text = `MESSAGE: ${(content || '').slice(0, 1500)}`;
+  return review(api, LINK_MESSAGE_PROMPT, [{ type: 'text', text }], ADULT_SPAM_SCHEMA);
 }
 
 /**
  * 채팅 모더레이터 판정.
- * @param {string} prompt 판정 지시 + 대화 (chatSafetyService 가 만든 것)
+ * @param {string} system 판정 지시
+ * @param {string} transcript 대화 (chatSafetyService 가 만든 것)
  * @param {string[]} categories 허용 분류 (none 포함)
  * @returns {Promise<{category:string,confidence:number,model:string}|null>} null → 판정 없음
  */
-async function judgeChat(prompt, categories) {
+async function judgeChat(system, transcript, categories) {
   const api = getClient();
   if (!api) return null;
-  return review(api, [{ type: 'text', text: prompt }], {
+  return review(api, system, [{ type: 'text', text: transcript }], {
     type: 'object',
     properties: { category: { type: 'string', enum: categories }, confidence: { type: 'number' } },
     required: ['category', 'confidence'],

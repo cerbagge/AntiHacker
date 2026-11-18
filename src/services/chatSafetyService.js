@@ -43,7 +43,7 @@ const CATEGORY_LABEL = {
 async function judge(lines) {
   const last = lines[lines.length - 1];
   const user = `[최근 대화]\n${lines.join('\n')}\n\n[판정 대상]\n${last}`;
-  const o = await claudeReviewService.judgeChat(`${JUDGE_PROMPT}\n\n${user}`, [...CATEGORIES, 'none']);
+  const o = await claudeReviewService.judgeChat(JUDGE_PROMPT, user, [...CATEGORIES, 'none']);
   if (!o) return null;
   return { category: CATEGORIES.includes(o.category) ? o.category : 'none', confidence: o.confidence, model: o.model };
 }
