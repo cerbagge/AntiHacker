@@ -58,6 +58,14 @@ const COMPACT_HINTS = [
   // 링크 없이 서버·방으로 끌어들이는 말 ("○○ 검색해서 들어오세요", "디코 서버 놀러오세요")
   ['join-lure', /들어오세요|놀러오세요|입장하세요|참여하세요|가입하세요|초대코드|서버홍보|디코서버|디스코드서버/],
 ];
+// 맨 도메인 신호에서 뺄 파일 확장자 (대화에 자주 나오는 파일 이름)
+const FILE_EXTS = [
+  'js', 'ts', 'jsx', 'tsx', 'mjs', 'cjs', 'py', 'java', 'kt', 'rs', 'go', 'rb', 'php', 'cs', 'cpp', 'hpp', 'sh', 'bat', 'ps1',
+  'json', 'yml', 'yaml', 'xml', 'toml', 'ini', 'cfg', 'env', 'lock', 'md', 'txt', 'log', 'csv', 'sql', 'html', 'htm', 'css', 'scss',
+  'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'ico', 'heic', 'mp3', 'mp4', 'wav', 'ogg', 'mov', 'avi', 'mkv', 'webm',
+  'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'hwp', 'zip', 'rar', 'gz', 'tar', 'exe', 'msi', 'dll', 'apk', 'iso', 'jar',
+].join('|');
+
 // 원문(소문자)에서 단어 경계로 찾는 문구
 const RAW_HINTS = [
   ['profile', /\b(bio|profile|about ?me)\b/],
@@ -66,8 +74,11 @@ const RAW_HINTS = [
   ['link-word', /\b(link|url|website|site)\b/],
   // 우회 표기 hxxp, h**p, [.] (.) (dot)
   ['obfuscated-url', /h(xx|\*\*|tt)ps?\s*[:：]|\[\s*[.。]\s*\]|\(\s*[.。]\s*\)|[([]\s*dot\s*[)\]]/],
-  // 맨 도메인 (http 없이, 띄어쓰기 우회 포함): abc.com / abc . com / abc。kr
+  // 맨 도메인 (http 없이, 띄어쓰기 우회 포함): abc.com / abc . com / abc。kr — 띄어쓰기 우회는 흔한 TLD 만 (영어 문장 오탐 방지)
   ['bare-domain', /\b[a-z0-9][a-z0-9-]{1,}\s*[.。．]\s*(com|net|org|kr|co|io|me|xyz|site|top|shop|gg|link|ly|to|cc|vip|club|online|store|app|bet|live|info|biz)\b/],
+  // 붙여 쓴 맨 도메인은 모든 TLD (promos.example.ai, abc.casino) — 파일 이름(index.js, image.png 등)은 제외.
+  // 1차 필터일 뿐이라 걸려도 AI 가 평범한 대화로 보면 통과한다.
+  ['bare-domain', new RegExp(`\\b[a-z0-9][a-z0-9-]{1,}(?:\\.[a-z0-9-]+)*\\.(?!(?:${FILE_EXTS})\\b)[a-z]{2,24}\\b(?!\\.[a-z])`)],
 ];
 
 const PROMPT = `너는 한국어·영어 디스코드 서버의 광고 차단 담당이다. 아래 [메시지]가 광고·홍보 스팸인지 판정한다.
