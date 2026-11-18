@@ -402,8 +402,36 @@ async function scanMessageInvites(client, text, ownGuildId, lang = DEFAULT_LANG)
   return finalizeContentVerdict(content, codes, channelTargets, lang);
 }
 
+/**
+ * 광고 차단(/adguard)용 — 다른 서버로 가는 디스코드 링크를 찾는다. 대상 서버가 성인/스팸인지는 보지 않는다.
+ *  - 초대: 대상이 이 서버가 아니면 광고 (만료·무효 초대, 그룹 DM 초대 포함). 네트워크 오류·레이트리밋은 통과(fail-open).
+ *  - 채널 딥링크: 서버ID가 이 서버가 아니면 광고. DM 딥링크(@me)는 서버 홍보가 아니라 통과.
+ * @returns {Promise<null | {kind:'invite'|'channel', target:string}>}
+ */
+async function findOtherServerLink(client, text, ownGuildId) {
+  for (const code of extractInviteCodes(text).slice(0, MAX_INVITES_PER_MESSAGE)) {
+    const key = `gid:${code}`;
+    let gid = getCache(key);
+    if (gid === undefined) {
+      try {
+        const invite = await client.fetchInvite(code);
+        gid = invite?.guild?.id || 'not-a-guild';
+      } catch (e) {
+        if (e.code !== 10006) continue; // 10006 Unknown Invite 만 확정, 그 외 오류는 판단 보류
+        gid = 'unknown-invite';
+      }
+      setCache(key, gid);
+    }
+    if (gid !== ownGuildId) return { kind: 'invite', target: `discord.gg/${code}` };
+  }
+  const ch = extractExternalChannelTargets(text, ownGuildId).find((c) => c.guild !== '@me');
+  if (ch) return { kind: 'channel', target: `discord.com/channels/${ch.guild}` };
+  return null;
+}
+
 module.exports = {
   scanMessageInvites,
+  findOtherServerLink,
   // 단위 테스트/재사용용
   extractInviteCodes,
   extractChannelTargets,

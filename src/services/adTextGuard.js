@@ -1,23 +1,30 @@
 /**
- * 광고성 글 가드 — 링크나 링크 유도 문구가 있는 메시지만 AI 에 보내 광고·홍보인지 판정한다.
+ * 광고성 글 가드 — `/adguard on` 한 서버에서만 동작 (기본 꺼짐). 그 서버는 광고를 받지 않겠다는 뜻이므로:
+ *
+ * 0) 다른 디스코드 서버로 가는 초대·채널 링크 → AI 없이 바로 삭제.
+ *    이 서버 초대·이 서버 메시지 링크·DM 링크는 통과.
  *
  * 1차 필터(정규식, 비용 0): 아래 중 하나라도 있어야 AI 에 묻는다.
- *  - 실제 URL (안전 도메인·디스코드 링크·GIF 는 제외 — 디스코드 초대는 초대 가드가 대상 서버로 판단)
+ *  - 실제 URL (안전 도메인·디스코드 자체 링크·GIF(tenor/giphy/klipy/imgur)·첨부 CDN 은 제외)
  *  - 맨 도메인·우회 표기: "abc.com", "abc . com", "hxxp", "[.]", "닷컴", "점컴"
  *  - 프로필 우회: "프로필 확인", "프 로 필", "바이오", "상메", "자기소개", "link in bio"
  *  - DM·외부 메신저 유도: "디엠", "갠메", "귓", "텔레", "t.me", "오픈채팅", "카톡"
  *  - 링크 언급: "링크", "사이트", "주소창", "검색하세요"
+ *  - 입장 유도: "들어오세요", "놀러오세요", "디코 서버", "초대코드"
  *  한국어 문구는 공백·기호를 지운 글에서 찾는다 ("프.로.필", "텔 레" 같은 띄어쓰기 우회도 잡힘).
  *
  * 2차 판정: Claude(1차 CLAUDE_MODEL → 애매하면 CLAUDE_ESCALATION_MODEL)
  *   → 키 없음·API 오류·한도 소진이면 로컬 Ollama(CHAT_MOD_MODEL). 둘 다 안 되면 통과(fail-open).
  *   confidence ≥ 0.9 → 삭제, 0.7 ≤ confidence < 0.9 → 관리자 알림, 그 외 통과.
- * 메시지 관리 권한(ManageMessages)이 있는 멤버는 검사하지 않는다 (공지·이벤트 링크).
+ * 메시지 관리 권한(ManageMessages)이 있는 멤버는 검사하지 않는다 (공지·이벤트·파트너 링크).
+ * 삭제해도 전역 해시 학습은 하지 않는다 — 광고를 허용하는 서버에서 같은 글이 지워지면 안 되므로.
  */
 const { PermissionsBitField } = require('discord.js');
 const config = require('../config');
 const logger = require('../utils/logger');
 const linkScanner = require('./linkScanner');
+const inviteScanner = require('./inviteScanner');
+const guildConfigStore = require('./guildConfigStore');
 const claudeReviewService = require('./claudeReviewService');
 const chatSafetyService = require('./chatSafetyService');
 const { t } = require('./i18n');
@@ -28,10 +35,12 @@ const MAX_TEXT_CHARS = 1500;
 // 로컬 LLM 은 CPU 에서 수 초 걸린다 — 동시에 이만큼 넘게 밀리면 새 메시지는 건너뛴다(fail-open)
 const MAX_LOCAL_PENDING = 5;
 
-// URL 이 있어도 광고 판정 대상이 아닌 도메인 (linkScanner 안전 도메인에 더해)
+// URL 이 있어도 AI 에 묻지 않는 도메인 (linkScanner 안전 도메인에 더해)
+//  - 디스코드 자체 링크·첨부 CDN·니트로 선물 (다른 서버 초대·채널 링크는 위 0) 단계가 따로 잡는다)
+//  - GIF: 디스코드 GIF 버튼이 보내는 tenor/klipy 링크, giphy, imgur
 const IGNORED_URL_DOMAINS = [
-  'discord.gg', 'discord.com', 'discordapp.com', 'discordapp.net', 'discord.media',
-  'tenor.com', 'giphy.com',
+  'discord.gg', 'discord.com', 'discordapp.com', 'discordapp.net', 'discord.media', 'discord.gift',
+  'tenor.com', 'tenor.co', 'giphy.com', 'klipy.com', 'imgur.com',
 ];
 // http 없이 적힌 무시 도메인 (discord.gg/abc 처럼) — 맨 도메인 신호로 다시 잡히지 않게 지운다
 const BARE_IGNORED = new RegExp(
@@ -43,7 +52,9 @@ const COMPACT_HINTS = [
   ['profile', /프로필|ㅍㄹㅍ|바이오|자기소개|소개글|상메|상태메시지|상태메세지|대화명|닉확인|닉네임확인|닉네임참고|닉참고/],
   ['dm', /디엠|갠메|갠디|개인메시지|개인메세지|귓말|귓속말|귓주|쪽지|갠톡|일대일문의|11문의/],
   ['messenger', /텔레|텔그|telegram|카톡|카카오톡|오픈채팅|오픈톡|오카방|오픈카톡|openkakao|위챗|wechat|왓츠앱|whatsapp|라인아이디|lineid/],
-  ['link-word', /링크|사이트|홈페이지|홈피|주소창|검색창|검색하세요|검색해보세요|검색ㄱ|도메인|닷컴|점컴|쩜컴|닷넷|점넷/],
+  ['link-word', /링크|사이트|홈페이지|홈피|주소창|검색창|검색하세요|검색해|검색ㄱ|도메인|닷컴|점컴|쩜컴|닷넷|점넷/],
+  // 링크 없이 서버·방으로 끌어들이는 말 ("○○ 검색해서 들어오세요", "디코 서버 놀러오세요")
+  ['join-lure', /들어오세요|놀러오세요|입장하세요|참여하세요|가입하세요|초대코드|서버홍보|디코서버|디스코드서버/],
 ];
 // 원문(소문자)에서 단어 경계로 찾는 문구
 const RAW_HINTS = [
@@ -59,7 +70,7 @@ const RAW_HINTS = [
 
 const PROMPT = `너는 한국어·영어 디스코드 서버의 광고 차단 담당이다. 아래 [메시지]가 광고·홍보 스팸인지 판정한다.
 광고(ad=true):
-- 외부 사이트·다른 서버·채널·상품·서비스로 사람을 끌어들이는 홍보: 도박·토토·카지노, 성인·조건만남·몸캠, 코인·주식 리딩방·투자, 대출·급전, 고수익 알바·부업, 계정·아이템·팔로워·구독자 판매, 핵·매크로·대리 판매 등
+- 외부 사이트·다른 디스코드 서버·채널·상품·서비스로 사람을 끌어들이는 홍보 (서버 이름을 검색해 들어오라는 것 포함): 도박·토토·카지노, 성인·조건만남·몸캠, 코인·주식 리딩방·투자, 대출·급전, 고수익 알바·부업, 계정·아이템·팔로워·구독자 판매, 핵·매크로·대리 판매 등
 - 링크를 직접 쓰지 않고 우회해서 유도하는 것: "프로필 확인", "바이오 참고", "상메 보세요", "DM 주세요", "텔레/오픈채팅으로", "naver . com", "닷컴", "검색창에 ○○"
 - 여러 곳에 뿌리는 듯한 홍보 문체 (혜택·가격 나열, 과장, 이모지 도배)
 광고 아님(ad=false):
@@ -147,8 +158,24 @@ async function judge(text, authorName) {
  *   autoDelete 면 scamResponder.handleScamDelete 에 그대로 넘기고, 아니면 trigger 로 관리자 알림.
  */
 async function check(message, text, lang) {
-  if (!config.AD_TEXT_GUARD_ENABLED || !message.guild) return null;
+  if (!message.guild || !guildConfigStore.getAdGuard(message.guild.id)) return null;
   if (message.member?.permissions?.has(PermissionsBitField.Flags.ManageMessages)) return null;
+
+  const link = await inviteScanner.findOtherServerLink(message.client, text, message.guild.id);
+  if (link) {
+    logger.info('광고성 글 삭제 대상 (다른 서버 디스코드 링크)', { author: message.author.tag, ...link });
+    return {
+      autoDelete: true,
+      suspicious: true,
+      trigger: {
+        dangerPercent: 100,
+        confidence: 1,
+        reason: t(lang, 'reason.adDiscord', { target: link.target }),
+        signals: [`discord-${link.kind}`],
+        source: 'discord-link',
+      },
+    };
+  }
 
   const hints = findHints(text);
   if (hints.length === 0) return null;

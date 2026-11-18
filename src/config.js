@@ -60,11 +60,6 @@ module.exports = Object.freeze({
   // ② 함께 적힌 문구가 스팸/성인 유인(키워드 + 로컬 AI)일 확률이 높을 때만 삭제. 기본 켬.
   INVITE_GUARD_ENABLED: process.env.INVITE_GUARD_ENABLED !== 'false',
 
-  // ── 광고성 글 가드 ──
-  // 링크(URL·맨 도메인·우회 표기)나 "프로필 확인"·DM·텔레그램 같은 유도 문구가 있는 글만 AI 에 보내 광고인지 판정.
-  // Claude(CLAUDE_MODEL → CLAUDE_ESCALATION_MODEL) 우선, 키 없음·API 오류면 로컬 CHAT_MOD_MODEL. 기본 켬.
-  AD_TEXT_GUARD_ENABLED: process.env.AD_TEXT_GUARD_ENABLED !== 'false',
-
   // ── 채팅 모더레이터 (실험 기능) ──
   // experimentalGuilds.json 에 적힌 서버에서만 동작. 판정·요약에 쓸 Ollama 텍스트 모델.
   CHAT_MOD_MODEL: process.env.CHAT_MOD_MODEL || 'exaone3.5:7.8b',

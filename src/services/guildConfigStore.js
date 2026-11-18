@@ -60,6 +60,9 @@ module.exports = {
   // 로그 메시지에 붙일 핑 대상(역할/유저 멘션 문자열, 예: "<@&123>" / "<@123>")
   getPingTarget: (g) => get(g).pingTarget || null,
   setPingTarget: (g, mention) => setField(g, 'pingTarget', mention),
+  // 광고성 글 가드 (/adguard, 기본 꺼짐)
+  getAdGuard: (g) => get(g).adGuard === 'on',
+  setAdGuard: (g, on) => setField(g, 'adGuard', on ? 'on' : null),
   // 자동 제재: type(timeout/kick/ban/none) + durationMs(타임아웃 전용)
   getSanction: (g) => ({
     type: get(g).sanctionType || 'none',

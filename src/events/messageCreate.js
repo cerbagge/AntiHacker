@@ -144,18 +144,19 @@ module.exports = (client) => {
         if (inviteVerdict) {
           if (!inviteVerdict.advisory) hashGuard.learnDeleted(allContent, allAttachments); // advisory 는 삭제 안 함
           await scamResponder.handleNsfwInviteDelete(message, inviteVerdict);
-          return; // 삭제 + 로그 완료 → 종료
+          // advisory(알림만)여도 광고 차단(/adguard on) 서버에선 아래 광고성 글 가드가 다른 서버 링크로 지운다
+          if (!inviteVerdict.advisory || !guildConfigStore.getAdGuard(message.guild.id)) return;
         }
       }
 
-      // ── 광고성 글 가드 ──
-      // 링크·"프로필 확인"·DM/텔레그램 유도 문구가 있는 글만 AI(Claude → 로컬 LLM)에 광고인지 묻는다.
-      // 확신도 0.9 이상 → 삭제, 0.7 이상 → 아래 관리자 알림에 포함. (유도 문구가 없으면 비용 0으로 통과)
+      // ── 광고성 글 가드 (/adguard on 한 서버만) ──
+      // 다른 서버 디스코드 링크 → 바로 삭제. 링크·"프로필 확인"·DM/텔레그램 유도 문구가 있는 글은 AI(Claude → 로컬 LLM)에
+      // 광고인지 묻는다: 확신도 0.9 이상 → 삭제, 0.7 이상 → 아래 관리자 알림에 포함. (유도 문구가 없으면 비용 0으로 통과)
+      // 해시 학습은 하지 않는다 — 학습은 전 서버 공통이라, 광고를 허용하는 서버에서 같은 글이 지워지면 안 된다.
       let adSuspicious = null;
       if (hasText) {
         const adResult = await adTextGuard.check(message, allContent, lang);
         if (adResult?.autoDelete) {
-          hashGuard.learnDeleted(allContent, allAttachments);
           await scamResponder.handleScamDelete(message, adResult);
           return;
         }

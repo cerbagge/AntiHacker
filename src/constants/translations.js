@@ -65,6 +65,7 @@ module.exports = {
     'reason.claudeScam': 'Claude flagged scam ({pct}%)',
     'reason.claudeSuspect': 'Claude suspicious ({pct}%)',
     'reason.adText': 'AI flagged as advertising ({pct}%, {model})',
+    'reason.adDiscord': 'Link to another Discord server ({target})',
     'reason.linkIp': 'IP-address-based suspicious URL',
     'reason.linkPhish': 'Phishing keyword detected: "{keyword}"',
     'reason.linkTldBrand': 'Suspicious TLD ({tld}) + brand ({brand}) combo',
@@ -85,6 +86,8 @@ module.exports = {
     'cmd.sanctionUnbanNote': ', auto-unban after expiry',
     'cmd.sanctionPermanent': 'permanent',
     'cmd.sanctionBadTime': 'Could not read the time "{time}". Use e.g. 4h3m13s — Y(year) M(month) h(hour) m(min) s(sec).',
+    'cmd.adGuardOn': 'Ad guard **on** — invites/links to other Discord servers are deleted, and messages with links or lures like "check my profile" / DM / Telegram are checked by AI and deleted if they are ads. Members with Manage Messages are exempt.',
+    'cmd.adGuardOff': 'Ad guard **off** — advertising is no longer blocked (scam/NSFW/virus protection stays on).',
     'cmd.adminOnly': 'Only users with the **Administrator** permission can use this command.',
     // 채팅 모더레이터 (실험 기능)
     'title.chatAction': '[Experimental] Harmful chat message actioned',
@@ -167,6 +170,7 @@ module.exports = {
     'reason.claudeScam': 'Claude 스캠 판정({pct}%)',
     'reason.claudeSuspect': 'Claude 의심({pct}%)',
     'reason.adText': 'AI 광고성 글 판정({pct}%, {model})',
+    'reason.adDiscord': '다른 디스코드 서버 링크 ({target})',
     'reason.linkIp': 'IP 주소 기반 의심스러운 URL',
     'reason.linkPhish': '피싱 의심 키워드 감지: "{keyword}"',
     'reason.linkTldBrand': '의심 TLD({tld}) + 브랜드({brand}) 조합',
@@ -186,6 +190,8 @@ module.exports = {
     'cmd.sanctionUnbanNote': ', 만료 후 자동 해제',
     'cmd.sanctionPermanent': '영구',
     'cmd.sanctionBadTime': '시간 "{time}" 을(를) 해석할 수 없습니다. 예: 4h3m13s — Y(년) M(월) h(시간) m(분) s(초).',
+    'cmd.adGuardOn': '광고 차단 **켬** — 다른 디스코드 서버 초대·링크는 삭제하고, 링크나 "프로필 확인"·DM·텔레그램 유도 문구가 있는 글은 AI 가 광고인지 판정해 삭제합니다. 메시지 관리 권한이 있는 멤버는 제외됩니다.',
+    'cmd.adGuardOff': '광고 차단 **끔** — 광고는 더 이상 막지 않습니다 (스캠·성인·바이러스 차단은 그대로).',
     'cmd.adminOnly': '**관리자 권한**을 가진 사용자만 이 명령을 사용할 수 있습니다.',
     // 채팅 모더레이터 (실험 기능)
     'title.chatAction': '[실험] 유해 채팅 조치',
