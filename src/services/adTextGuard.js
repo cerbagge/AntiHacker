@@ -164,16 +164,20 @@ async function judgeImage(scan, text, authorName) {
 
 /**
  * messageCreate 에서 호출.
- * @param {Array<{buffer:Buffer, ocrText?:string, qrUrl?:string, attachmentName?:string}>} images 스캠 이미지 스캐너 결과
+ * @param {object} [opts]
+ * @param {Array<{buffer:Buffer, ocrText?:string, qrUrl?:string, attachmentName?:string}>} [opts.images] 스캠 이미지 스캐너 결과
+ * @param {boolean} [opts.judgeText=true] false 면 글은 이미지 판정의 맥락으로만 쓰고, 글 판정·글 속 디스코드 링크 검사는 하지 않는다
+ *   (messageCreate 가 이미지 처리 슬롯 안에서 이미지만 먼저 보고, 글은 초대 가드 뒤에서 따로 본다)
  * @returns {Promise<null | {autoDelete:boolean, suspicious:true, trigger:object}>}
  *   autoDelete 면 scamResponder.handleScamDelete 에 그대로 넘기고, 아니면 trigger 로 관리자 알림.
  */
-async function check(message, text, lang, images = []) {
+async function check(message, text, lang, { images = [], judgeText = true } = {}) {
   if (!message.guild || !guildConfigStore.getAdGuard(message.guild.id)) return null;
   if (message.member?.permissions?.has(PermissionsBitField.Flags.ManageMessages)) return null;
 
   const qrText = images.map((i) => i.qrUrl).filter(Boolean).join('\n');
-  const link = await inviteScanner.findOtherServerLink(message.client, `${text || ''}\n${qrText}`, message.guild.id);
+  const linkText = judgeText ? `${text || ''}\n${qrText}` : qrText;
+  const link = linkText.trim() ? await inviteScanner.findOtherServerLink(message.client, linkText, message.guild.id) : null;
   if (link) {
     logger.info('광고성 글 삭제 대상 (다른 서버 디스코드 링크)', { author: message.author.tag, ...link });
     return {
@@ -192,7 +196,7 @@ async function check(message, text, lang, images = []) {
   const authorName = message.member?.displayName || message.author.globalName || message.author.username;
   let best = null; // { verdict, hints, scan? }
 
-  const hints = findHints(text);
+  const hints = judgeText ? findHints(text) : [];
   if (hints.length > 0) {
     const v = await judge(text, authorName);
     if (v && v.ad) best = { verdict: v, hints };

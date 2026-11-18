@@ -81,7 +81,7 @@ module.exports = (client) => {
       // 다운로드 전에 슬롯을 잡아, 대기 메시지는 버퍼를 안 들게 한다(메모리=동시처리 수로 고정).
       // 대기열까지 가득 차면 과부하로 보고 검사를 건너뛴다(fail-open).
       let scamSuspicious = null;
-      let imageScans = []; // 스캠 스캐너가 뽑은 이미지별 OCR 글자·QR — 아래 광고성 글 가드가 재사용
+      let adSuspicious = null; // 광고성 글 가드(이미지·글)의 알림 대상 판정
       let slot = false;
       if (allAttachments.length > 0) {
         slot = await imageQueue.acquire();
@@ -116,7 +116,6 @@ module.exports = (client) => {
           const scamImages = allAttachments.filter(scamImageScanner.isImageAttachment);
           if (scamImages.length > 0) {
             const scamResult = await scamImageScanner.scanMessageImages(scamImages, allContent, attachmentBuffers, lang);
-            imageScans = scamResult.scanned.map((s) => s.result).filter(Boolean);
             if (scamResult.autoDelete) {
               hashGuard.learnDeleted(allContent); // 이미지 해시는 스캐너가 이미 학습
               await scamResponder.handleScamDelete(message, scamResult);
@@ -130,6 +129,16 @@ module.exports = (client) => {
                 signals: scamSuspicious.signals,
               });
             }
+
+            // ── 광고 이미지 (/adguard on 서버) — 이미지 버퍼를 쓰므로 이 슬롯 안에서 판정 (동시성 상한 유지) ──
+            // 스캐너가 뽑은 OCR 글자·QR 로 1차 필터 → 걸린 이미지만 Claude. 글 판정·글 속 디스코드 링크는 초대 가드 뒤에서 본다.
+            const imageScans = scamResult.scanned.map((s) => s.result).filter(Boolean);
+            const adImage = await adTextGuard.check(message, allContent, lang, { images: imageScans, judgeText: false });
+            if (adImage?.autoDelete) {
+              await scamResponder.handleScamDelete(message, adImage);
+              return;
+            }
+            if (adImage) adSuspicious = adImage.trigger;
           }
         }
       } finally {
@@ -152,17 +161,19 @@ module.exports = (client) => {
       }
 
       // ── 광고성 글 가드 (/adguard on 한 서버만) ──
-      // 다른 서버 디스코드 링크 → 바로 삭제. 링크·"프로필 확인"·DM/텔레그램 유도 문구가 있는 글·이미지(OCR·QR)는 AI(Claude)에
+      // 다른 서버 디스코드 링크 → 바로 삭제. 링크·"프로필 확인"·DM/텔레그램 유도 문구가 있는 글은 AI(Claude)에
       // 광고인지 묻는다: 확신도 0.9 이상 → 삭제, 0.7 이상 → 아래 관리자 알림에 포함. (유도 문구가 없으면 비용 0으로 통과)
-      // 해시 학습은 하지 않는다 — 학습은 전 서버 공통이라, 광고를 허용하는 서버에서 같은 글이 지워지면 안 된다.
-      let adSuspicious = null;
-      if (hasText || imageScans.length > 0) {
-        const adResult = await adTextGuard.check(message, allContent, lang, imageScans);
+      // 이미지 광고는 위 이미지 처리 슬롯 안에서 이미 봤다. 해시 학습은 하지 않는다 — 학습은 전 서버 공통이라,
+      // 광고를 허용하는 서버에서 같은 글이 지워지면 안 된다.
+      if (hasText) {
+        const adResult = await adTextGuard.check(message, allContent, lang);
         if (adResult?.autoDelete) {
           await scamResponder.handleScamDelete(message, adResult);
           return;
         }
-        if (adResult) adSuspicious = adResult.trigger;
+        if (adResult && (!adSuspicious || adResult.trigger.dangerPercent > adSuspicious.dangerPercent)) {
+          adSuspicious = adResult.trigger;
+        }
       }
 
       // ── 로컬 위협 검사 (Gemini 미사용): 링크 피싱 패턴 + 파일 확장자 스캐너 ──
