@@ -6,6 +6,9 @@
  * 이 스캠은 동일 이미지가 서버마다 반복 게시되므로 가장 싸고 효과적인 1차 필터.
  * 삭제된 메시지의 글 내용도 SHA-256 으로 저장해, 똑같은 글이 다시 올라오면 즉시 지운다.
  *
+ * 광고 이미지 해시(adHashes)는 따로 둔다 — 광고 가드(/adguard on)가 삭제한 이미지.
+ * 광고를 허용하는 서버도 있으므로 스캠 해시와 섞지 않고, 광고 가드를 켠 서버에서만 매칭한다(adTextGuard).
+ *
  * 저장 방식은 기존 optoutStore.js 컨벤션을 따름 (루트에 JSON 파일).
  */
 const crypto = require('crypto');
@@ -32,12 +35,14 @@ const MIN_TEXT_LEN = 15;
 
 let hashes = [];
 let texts = new Set();
+let adHashes = [];
 try {
   if (fs.existsSync(HASH_PATH)) {
     const data = JSON.parse(fs.readFileSync(HASH_PATH, 'utf-8'));
     if (data && data.version === STORE_VERSION && Array.isArray(data.hashes)) {
       hashes = data.hashes;
       if (Array.isArray(data.texts)) texts = new Set(data.texts);
+      if (Array.isArray(data.adHashes)) adHashes = data.adHashes;
     } else {
       const legacyPath = `${HASH_PATH}.legacy-v${(data && data.version) || 1}`;
       fs.renameSync(HASH_PATH, legacyPath);
@@ -54,7 +59,12 @@ try {
 
 function save() {
   try {
-    const data = { version: STORE_VERSION, hashes: hashes.slice(-MAX_ENTRIES), texts: [...texts].slice(-MAX_ENTRIES) };
+    const data = {
+      version: STORE_VERSION,
+      hashes: hashes.slice(-MAX_ENTRIES),
+      texts: [...texts].slice(-MAX_ENTRIES),
+      adHashes: adHashes.slice(-MAX_ENTRIES),
+    };
     fs.writeFileSync(HASH_PATH, JSON.stringify(data, null, 0));
   } catch (e) {
     logger.warn('scamHashes.json 저장 실패', { error: e.message });
@@ -71,14 +81,33 @@ function hammingDistance(a, b) {
   return dist;
 }
 
-/** 알려진 스캠 해시와 일치(근접)하는지 → 일치 시 { hash, distance }, 없으면 null */
-function matchKnownScam(hash, maxDistance = DEFAULT_MAX_DISTANCE) {
+function matchIn(list, hash, maxDistance) {
   if (!hash) return null;
-  for (const known of hashes) {
+  for (const known of list) {
     const d = hammingDistance(hash, known);
     if (d <= maxDistance) return { hash: known, distance: d };
   }
   return null;
+}
+
+/** 알려진 스캠 해시와 일치(근접)하는지 → 일치 시 { hash, distance }, 없으면 null */
+function matchKnownScam(hash, maxDistance = DEFAULT_MAX_DISTANCE) {
+  return matchIn(hashes, hash, maxDistance);
+}
+
+/** 광고 가드가 삭제한 적 있는 광고 이미지와 일치(근접)하는지 → { hash, distance } | null */
+function matchKnownAd(hash, maxDistance = DEFAULT_MAX_DISTANCE) {
+  return matchIn(adHashes, hash, maxDistance);
+}
+
+/** 광고 이미지 해시 추가 (이미 근접한 게 있으면 중복 저장 안 함) */
+function addAdHash(hash) {
+  if (!hash || typeof hash !== 'string') return false;
+  if (matchKnownAd(hash, 8)) return false;
+  adHashes.push(hash);
+  if (adHashes.length > MAX_ENTRIES) adHashes = adHashes.slice(-MAX_ENTRIES); // 메모리·매칭 비용 상한
+  save();
+  return true;
 }
 
 /** 새 스캠 해시 추가 (이미 근접한 게 있으면 중복 저장 안 함) */
@@ -117,5 +146,6 @@ function count() {
 }
 
 module.exports = {
-  matchKnownScam, addScamHash, matchKnownText, addScamText, hammingDistance, count, DEFAULT_MAX_DISTANCE,
+  matchKnownScam, addScamHash, matchKnownText, addScamText, matchKnownAd, addAdHash,
+  hammingDistance, count, DEFAULT_MAX_DISTANCE,
 };

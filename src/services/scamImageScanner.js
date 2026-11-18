@@ -530,6 +530,27 @@ async function scanMessageImages(imageAttachments, messageText, prefetched, lang
   return { autoDelete: false, suspicious: !!topSuspicious, trigger: topSuspicious, scanned };
 }
 
+/**
+ * 흑백·대비 보정 후 다시 OCR. 색 배경 위 어두운 상자 속 밝은 글자처럼 원본 OCR 이 놓치는 글자를 읽는다
+ * (광고 가드가 원본 OCR 에서 신호가 없던 이미지에만 쓴다). 실패 시 ''
+ */
+async function ocrEnhanced(buffer) {
+  try {
+    const png = await sharp(buffer)
+      .resize({ width: OCR_MAX_WIDTH, withoutEnlargement: true })
+      .greyscale()
+      .normalise()
+      .png()
+      .toBuffer();
+    const worker = await getWorker();
+    const { data } = await worker.recognize(png);
+    return (data && data.text) ? data.text : '';
+  } catch (e) {
+    logger.warn('보정 OCR 실패', { error: e.message });
+    return '';
+  }
+}
+
 async function shutdown() {
   if (workerPromise) {
     try {
@@ -540,4 +561,4 @@ async function shutdown() {
   }
 }
 
-module.exports = { scanImage, scanMessageImages, downloadAttachment, isImageAttachment, hashImage, shutdown };
+module.exports = { scanImage, scanMessageImages, ocrEnhanced, downloadAttachment, isImageAttachment, hashImage, shutdown };

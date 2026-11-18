@@ -415,9 +415,21 @@ async function findOtherServerLink(client, text, ownGuildId) {
   return null;
 }
 
+/**
+ * findOtherServerLink 가 이 서버 것으로 확인한 초대 링크와 이 서버 채널 링크를 지운다.
+ * 광고 가드가 AI 판정 전에 쓴다 — '우리 서버 이벤트 참여하세요 discord.gg/…' 같은 공지가 광고로 오판되지 않게.
+ * 확인하지 못한 초대(조회 오류)는 남긴다.
+ */
+function stripOwnDiscordLinks(text, ownGuildId) {
+  return String(text || '')
+    .replace(INVITE_REGEX, (m, code) => (getCache(`gid:${code}`) === ownGuildId ? ' ' : m))
+    .replace(CHANNEL_LINK_REGEX, (m, guild) => (guild === ownGuildId ? ' ' : m));
+}
+
 module.exports = {
   scanMessageInvites,
   findOtherServerLink,
+  stripOwnDiscordLinks,
   // 단위 테스트/재사용용
   extractInviteCodes,
   extractChannelTargets,

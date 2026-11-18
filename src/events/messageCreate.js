@@ -135,7 +135,7 @@ module.exports = (client) => {
             const imageScans = scamResult.scanned.map((s) => s.result).filter(Boolean);
             const adImage = await adTextGuard.check(message, allContent, lang, { images: imageScans, judgeText: false });
             if (adImage?.autoDelete) {
-              await scamResponder.handleScamDelete(message, adImage);
+              await scamResponder.handleScamDelete(message, adImage, { sanction: adImage.sanction });
               return;
             }
             if (adImage) adSuspicious = adImage.trigger;
@@ -168,7 +168,7 @@ module.exports = (client) => {
       if (hasText) {
         const adResult = await adTextGuard.check(message, allContent, lang);
         if (adResult?.autoDelete) {
-          await scamResponder.handleScamDelete(message, adResult);
+          await scamResponder.handleScamDelete(message, adResult, { sanction: adResult.sanction });
           return;
         }
         if (adResult && (!adSuspicious || adResult.trigger.dangerPercent > adSuspicious.dangerPercent)) {
