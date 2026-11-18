@@ -214,11 +214,11 @@ async function aiVerdictText(ai, lang) {
 /**
  * 허니팟(스팸 함정) 채널 적발 → 삭제 + AI 판정 + 서버 로그 채널.
  * 스팸이거나 AI 판정 불가면 연관 스윕 + 제재, 일반 유저 실수(clean)면 삭제 + 로그만.
- * @param {{content?:string, attachments?:Array, allowCloud?:boolean}} [input] allowCloud=false → Claude 생략(학습거부 유저)
+ * @param {{content?:string, attachments?:Array}} [input]
  * @returns {Promise<{verdict:'spam'|'clean'|'unavailable', buffers:Map<string, Buffer>}>}
  *   AI 판정과 미리 받아 둔 첨부 (호출부가 해시 학습 여부를 정한다)
  */
-async function handleHoneypot(message, { content = message.content || '', attachments = [], allowCloud = true } = {}) {
+async function handleHoneypot(message, { content = message.content || '', attachments = [] } = {}) {
   const lang = guildConfigStore.getLanguage(message.guild?.id);
 
   // 삭제 전에 판정 슬롯을 잡고 첨부 다운로드를 시작 — 삭제된 메시지의 첨부는 곧 내려간다
@@ -229,7 +229,7 @@ async function handleHoneypot(message, { content = message.content || '', attach
 
   // ── AI 판정 ── 삭제는 이미 했고, 스윕·제재(·호출부의 해시 학습)는 이 판정으로 정한다.
   // 'clean'(일반 유저 실수)만 봐주고, AI를 못 쓰거나 믿기 어려우면('unavailable') 스팸으로 처리한다.
-  const { ai, buffers } = await judging.finish(content, allowCloud);
+  const { ai, buffers } = await judging.finish(content);
   const punish = ai.verdict !== 'clean';
 
   const alert = alertStore.createAlert({

@@ -2,7 +2,7 @@
  * 서버(길드)별 설정 저장소 — 허니팟(스팸 함정) 채널 + 로그 채널
  *
  * `guildConfig.json`(루트): { "<guildId>": { "spamChannelId": "...", "logChannelId": "..." } }
- * 저장 컨벤션은 optoutStore / guildAllowlistStore 와 동일(루트 JSON, sync load/save).
+ * 저장 컨벤션은 guildAllowlistStore 와 동일(루트 JSON, sync load/save).
  */
 const fs = require('fs');
 const path = require('path');
