@@ -14,15 +14,13 @@
  *
  *   공통 판정(classifyServer, 순수):
  *      a. 공식 nsfwLevel == Explicit(1) | AgeRestricted(3) → 성인(즉시, AI 불필요)
- *      b. 로컬 AI(VLM)가 이름+설명+아이콘 보고 adult/spam 판정 (신뢰도 임계값 이상)
+ *      b. Claude 가 이름+설명+아이콘 보고 adult/spam 판정 (신뢰도 임계값 이상, 단독으로는 알림만)
  *      c. AI 불가/미달 시 노골적 키워드 폴백
  *
- * 도배 보호: 메시지당 링크 상한, 코드/길드별 결과 캐시(TTL), AI 호출은 imageQueue 슬롯으로 동시성 제한.
+ * 도배 보호: 메시지당 링크 상한, 코드/길드별 결과 캐시(TTL).
  */
-const config = require('../config');
 const logger = require('../utils/logger');
-const localVlmService = require('./localVlmService');
-const imageQueue = require('./imageQueue');
+const claudeReviewService = require('./claudeReviewService');
 const { t, DEFAULT_LANG } = require('./i18n');
 
 // GuildNSFWLevel: Default=0, Explicit=1, Safe=2, AgeRestricted=3
@@ -131,8 +129,8 @@ function classifyContentKeywords(text) {
 }
 
 /**
- * 메시지 문구 AI 판정 (로컬 VLM, 텍스트 전용). 스팸/성인 유인 확신이 임계값 이상일 때만 verdict.
- * 같은 문구 도배 대비 문구별 캐시. VLM 불가/슬롯 없음/호출 실패 시 null(캐시 안 함 = 다음에 재시도).
+ * 메시지 문구 AI 판정 (Claude, 텍스트 전용). 스팸/성인 유인 확신이 임계값 이상일 때만 verdict.
+ * 같은 문구 도배 대비 문구별 캐시. Claude 불가/호출 실패 시 null(캐시 안 함 = 다음에 재시도).
  * @returns {Promise<null | {adult:boolean, spam:boolean, source:'content-ai', detail:string, confidence:number}>}
  */
 async function classifyContentAi(text) {
@@ -143,19 +141,8 @@ async function classifyContentAi(text) {
   const cached = getCache(cacheKey);
   if (cached !== undefined) return cached;
 
-  if (!config.SCAM_VLM_ENABLED || !(await localVlmService.isAvailable())) return null;
-  const slot = await imageQueue.acquire();
-  if (!slot) return null;
-
-  let ai = null;
-  try {
-    ai = await localVlmService.analyzeLinkMessage({ content });
-  } catch (e) {
-    logger.warn('링크 메시지 문구 AI 분석 실패', { error: e.message });
-  } finally {
-    imageQueue.release();
-  }
-  if (!ai) return null; // 호출/파싱 실패 — 캐시하지 않음
+  const ai = await claudeReviewService.analyzeLinkMessage({ content });
+  if (!ai) return null; // Claude 불가/호출 실패 — 캐시하지 않음
 
   // AI 단독으로는 삭제하지 않는다(오탐 위험) — 알림만 남기는 advisory 판정.
   const verdict = (ai.adult || ai.spam) && ai.confidence >= AI_DELETE_CONFIDENCE
@@ -242,7 +229,7 @@ function finalize(verdict, code, guild) {
 
 /**
  * 해석된 길드(초대 대상/채널 링크 대상 공용)를 판정 → classifyServer verdict|null.
- * 공식 등급이면 즉시, 아니면 로컬 AI(가용 + 슬롯 확보 시) → 키워드 폴백.
+ * 공식 등급이면 즉시, 아니면 Claude → 키워드 폴백.
  */
 async function analyzeGuildVerdict(guild, logCtx = {}) {
   const name = guild.name;
@@ -254,22 +241,15 @@ async function analyzeGuildVerdict(guild, logCtx = {}) {
     return { adult: true, spam: false, source: 'nsfwLevel', detail: String(nsfwLevel), confidence: 1 };
   }
 
-  // b) 로컬 AI 분석 (VLM 가용 + 큐 슬롯 확보 시에만)
+  // b) Claude 분석 (키 없음·오류면 null → 키워드만)
   let ai = null;
-  if (config.SCAM_VLM_ENABLED && (await localVlmService.isAvailable())) {
-    const slot = await imageQueue.acquire();
-    if (slot) {
-      try {
-        let iconBuffer = null;
-        const iconUrl = typeof guild.iconURL === 'function' ? guild.iconURL({ extension: 'png', size: 128 }) : null;
-        if (iconUrl) iconBuffer = await downloadImage(iconUrl);
-        ai = await localVlmService.analyzeDiscordServer({ name, description, iconBuffer });
-      } catch (e) {
-        logger.warn('대상 서버 AI 분석 실패', { ...logCtx, error: e.message });
-      } finally {
-        imageQueue.release();
-      }
-    }
+  try {
+    let iconBuffer = null;
+    const iconUrl = typeof guild.iconURL === 'function' ? guild.iconURL({ extension: 'png', size: 128 }) : null;
+    if (iconUrl) iconBuffer = await downloadImage(iconUrl);
+    ai = await claudeReviewService.analyzeDiscordServer({ name, description, iconBuffer });
+  } catch (e) {
+    logger.warn('대상 서버 AI 분석 실패', { ...logCtx, error: e.message });
   }
 
   // c) 최종 판정(AI + 키워드 폴백)

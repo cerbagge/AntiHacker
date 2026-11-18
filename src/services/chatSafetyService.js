@@ -1,15 +1,13 @@
 /**
- * 로컬 LLM(Ollama) 채팅 판정·요약 — 채팅 모더레이터(실험 기능) 전용
+ * 채팅 판정·요약 (Claude) — 채팅 모더레이터(실험 기능) 전용
  *
  * judge(): 최근 대화 6줄 중 마지막 줄이 성적/자해/폭력/혐오 위반인지 판정 (짧은 JSON만 받아 빠르게)
  * summarize(): 로그용 요약 — 원문 인용 없이 대화 흐름만. 조치·알림 대상일 때만 호출한다.
  *
- * 모델 기본값 exaone3.5:7.8b — i7-8700 CPU 실측 판정 중앙값 약 4초.
- * 한국어 54문장 실측에서 confidence 0.9 이상만 조치하면 무고한 조치 0건 (오탐은 0.8로 나옴).
- * Ollama가 없거나 오류면 null 을 반환해 아무 조치도 하지 않는다.
+ * claudeReviewService 를 쓴다 (판정: Haiku → 애매하면 Sonnet, 요약: Haiku).
+ * 키가 없거나 API 오류면 null 을 반환해 아무 조치도 하지 않는다.
  */
-const config = require('../config');
-const logger = require('../utils/logger');
+const claudeReviewService = require('./claudeReviewService');
 
 const CATEGORIES = ['sexual', 'self_harm', 'violence', 'hate'];
 
@@ -38,47 +36,16 @@ const CATEGORY_LABEL = {
   en: { sexual: 'sexual/NSFW', self_harm: 'suicide/self-harm', violence: 'threat of violence', hate: 'hate/severe insult' },
 };
 
-async function chat(messages, { format, numPredict, timeoutMs }) {
-  const res = await fetch(`${config.OLLAMA_URL}/api/chat`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: config.CHAT_MOD_MODEL,
-      messages,
-      stream: false,
-      keep_alive: -1, // 상주 — 매 메시지마다 모델 재로딩 방지
-      ...(format ? { format } : {}),
-      // 판정 대상은 잘라내지 않으므로(디스코드 최대 4000자) 넉넉히. 판정·요약이 같은 값이어야 모델을 다시 올리지 않는다
-      options: { temperature: 0, num_ctx: 8192, num_predict: numPredict },
-    }),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const data = await res.json();
-  return data.message?.content || '';
-}
-
 /**
  * @param {string[]} lines "이름: 내용" 형식, 마지막 줄이 판정 대상 (최대 6줄)
- * @returns {Promise<{category:string, confidence:number}|null>} 오류 시 null
+ * @returns {Promise<{category:string, confidence:number, model:string}|null>} 오류 시 null
  */
 async function judge(lines) {
   const last = lines[lines.length - 1];
   const user = `[최근 대화]\n${lines.join('\n')}\n\n[판정 대상]\n${last}`;
-  try {
-    const raw = await chat(
-      [{ role: 'system', content: JUDGE_PROMPT }, { role: 'user', content: user }],
-      { format: 'json', numPredict: 40, timeoutMs: 60000 },
-    );
-    const o = JSON.parse(raw);
-    return {
-      category: CATEGORIES.includes(o.category) ? o.category : 'none',
-      confidence: Math.min(1, Math.max(0, Number(o.confidence) || 0)),
-    };
-  } catch (e) {
-    logger.warn('채팅 판정 LLM 호출 실패', { error: e.message });
-    return null;
-  }
+  const o = await claudeReviewService.judgeChat(`${JUDGE_PROMPT}\n\n${user}`, [...CATEGORIES, 'none']);
+  if (!o) return null;
+  return { category: CATEGORIES.includes(o.category) ? o.category : 'none', confidence: o.confidence, model: o.model };
 }
 
 /**
@@ -90,17 +57,11 @@ async function judge(lines) {
 async function summarize(lines, category, lang) {
   const L = SUMMARY_PROMPT[lang] ? lang : 'en';
   const prompt = SUMMARY_PROMPT[L].replace('{cat}', CATEGORY_LABEL[L][category] || category);
-  try {
-    const text = await chat(
-      // 대화가 한국어면 지시와 무관하게 한국어로 답하는 경향이 있어 끝에 출력 언어를 다시 못박는다
-      [{ role: 'system', content: prompt }, { role: 'user', content: `${lines.join('\n')}\n\n${L === 'ko' ? '(한국어로 요약)' : '(Write the summary in English.)'}` }],
-      { numPredict: 200, timeoutMs: 120000 },
-    );
-    return text.trim() || null;
-  } catch (e) {
-    logger.warn('채팅 요약 LLM 호출 실패', { error: e.message });
-    return null;
-  }
+  // 대화가 한국어면 지시와 무관하게 한국어로 답하는 경향이 있어 끝에 출력 언어를 다시 못박는다
+  return claudeReviewService.summarizeChat(
+    prompt,
+    `${lines.join('\n')}\n\n${L === 'ko' ? '(한국어로 요약)' : '(Write the summary in English.)'}`,
+  );
 }
 
-module.exports = { judge, summarize, chat, CATEGORIES };
+module.exports = { judge, summarize, CATEGORIES };

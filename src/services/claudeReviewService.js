@@ -1,21 +1,24 @@
 /**
- * Claude 최종 검수 — 코인 스캠 이미지 2차 판정 + 광고성 글 판정
+ * Claude 판정 — 봇의 모든 AI 판정을 맡는다 (로컬 모델 없음).
  *
- * analyzeImage: scamImageScanner 의 VLM 단계에서 로컬 VLM보다 먼저 호출된다.
- * analyzeText / analyzeAdImage: adTextGuard 가 링크·우회 유도 문구가 있는 글·이미지를 광고인지 물을 때 쓴다.
- *   1차 CLAUDE_MODEL(기본 Haiku 5.5, 빠르고 쌈) → 판단을 못 하면(거부·미완료·확신도 0.8 미만)
- *   2차 CLAUDE_ESCALATION_MODEL(기본 Sonnet 5.5) 에 다시 묻는다.
+ * analyzeImage: 코인 스캠 이미지 2차 판정 (scamImageScanner)
+ * analyzeText / analyzeAdImage: 광고성 글·이미지 판정 (adTextGuard)
+ * analyzeDiscordServer / analyzeLinkMessage: 초대 대상 서버·링크 동반 문구 판정 (inviteScanner)
+ * judgeChat / summarizeChat: 채팅 모더레이터 판정·로그 요약 (chatSafetyService)
+ *
+ *   판정은 1차 CLAUDE_MODEL(기본 Haiku 5.5, 빠르고 쌈) → 판단을 못 하면(거부·미완료·확신도 0.8 미만)
+ *   2차 CLAUDE_ESCALATION_MODEL(기본 Sonnet 5.5) 에 다시 묻는다. 요약은 1차 모델만 쓴다.
  * ANTHROPIC_API_KEY 가 없거나 1차 호출이 API 오류(한도 소진·과부하·인증 등)·타임아웃이면
- * null 을 돌려주고, 호출부가 로컬 VLM(Ollama)으로 전환한다.
+ * null 을 돌려주고, 호출부는 AI 없이 진행한다 (로컬 점수·키워드만, 또는 검사 건너뜀 = 통과).
  * 오류가 나면 그 모델은 잠시(retry-after, 없으면 400 은 1분·그 외 5분) 호출을 멈춰
- * 이미지마다 실패를 기다리지 않는다.
- * 판정 이유(reason)는 받지 않는다 — 스키마로 {scam|ad, confidence} 만 출력하게 강제.
+ * 요청마다 실패를 기다리지 않는다.
+ * 출력은 JSON 스키마로 강제한다. 이유(reason)는 기존 로그 형식이 쓰는 초대 가드 판정에서만 받는다.
  */
 const Anthropic = require('@anthropic-ai/sdk');
 const Jimp = require('jimp');
 const config = require('../config');
 const logger = require('../utils/logger');
-const { PROMPT } = require('./localVlmService');
+const { PROMPT, SERVER_PROMPT, LINK_MESSAGE_PROMPT } = require('../constants/aiPrompts');
 
 // Claude 는 긴 변 1568px 초과 이미지를 서버에서 줄이므로 미리 줄여 업로드량을 아낀다.
 const MAX_SIDE = 1568;
@@ -27,25 +30,35 @@ const ESCALATE_BELOW = 0.8;
 // 거부·미완료·형식 오류 — API 는 정상이지만 판정을 못 받은 경우
 const UNDECIDED = 'undecided';
 
-function schemaFor(field) {
+function boolSchema(field) {
   return {
     type: 'object',
-    properties: {
-      [field]: { type: 'boolean' },
-      confidence: { type: 'number' },
-    },
+    properties: { [field]: { type: 'boolean' }, confidence: { type: 'number' } },
     required: [field, 'confidence'],
     additionalProperties: false,
   };
 }
+
+const ADULT_SPAM_SCHEMA = {
+  type: 'object',
+  properties: {
+    adult: { type: 'boolean' },
+    spam: { type: 'boolean' },
+    confidence: { type: 'number' },
+    reason: { type: 'string' },
+  },
+  required: ['adult', 'spam', 'confidence', 'reason'],
+  additionalProperties: false,
+};
 
 let client = null;
 const pausedUntil = {}; // 모델별 — 한 모델의 429 가 다른 모델을 막지 않게
 
 function getClient() {
   if (!config.CLAUDE_REVIEW_ENABLED) return null;
+  if (Date.now() < (pausedUntil[config.CLAUDE_MODEL] || 0)) return null; // 1차 모델이 쉬는 중 → AI 없이 진행
   if (!client) {
-    // 재시도 없이 바로 실패시켜 로컬 VLM으로 넘긴다 (SDK 기본: 2회 재시도 + 10분 타임아웃)
+    // 재시도 없이 바로 실패시킨다 — 메시지 처리가 오래 막히지 않게 (SDK 기본: 2회 재시도 + 10분 타임아웃)
     client = new Anthropic({ timeout: config.CLAUDE_TIMEOUT_MS, maxRetries: 0 });
   }
   return client;
@@ -66,6 +79,13 @@ async function toJpeg(buffer) {
   }
 }
 
+function imageContent(jpeg, text) {
+  return [
+    { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: jpeg.toString('base64') } },
+    { type: 'text', text },
+  ];
+}
+
 /** 이 오류 뒤 그 모델을 얼마나 쉴지(ms). 413(그 이미지만 너무 큼)은 쉬지 않는다 */
 function pauseMsFor(e) {
   if (e.status === 413) return 0;
@@ -74,96 +94,145 @@ function pauseMsFor(e) {
   return e.status === 400 ? BAD_REQUEST_PAUSE_MS : DEFAULT_PAUSE_MS;
 }
 
-/** 한 모델에 묻는다. → 판정 | UNDECIDED(거부·미완료·형식 오류) | null(API 오류·쉬는 중) */
-async function ask(api, model, content, field) {
+/** API 호출. → 응답 | null(API 오류·쉬는 중 — 쉬기 처리까지 함) */
+async function call(api, model, params) {
   if (Date.now() < (pausedUntil[model] || 0)) return null;
-
-  let res;
   try {
-    res = await api.messages.create({
-      model,
-      max_tokens: 4096,
-      output_config: { effort: 'low', format: { type: 'json_schema', schema: schemaFor(field) } },
-      messages: [{ role: 'user', content }],
-    });
+    return await api.messages.create({ model, ...params });
   } catch (e) {
     const pauseMs = pauseMsFor(e);
     if (pauseMs) pausedUntil[model] = Date.now() + pauseMs;
-    logger.warn('Claude 최종검수 호출 실패', { model, status: e.status, error: e.message, pauseSec: Math.round(pauseMs / 1000) });
+    logger.warn('Claude 호출 실패', { model, status: e.status, error: e.message, pauseSec: Math.round(pauseMs / 1000) });
     return null;
   }
+}
+
+/** 한 모델에 JSON 판정을 묻는다. → {...스키마 필드, confidence, model} | UNDECIDED(거부·미완료·형식 오류) | null(API 오류) */
+async function ask(api, model, content, schema) {
+  const res = await call(api, model, {
+    max_tokens: 4096,
+    output_config: { effort: 'low', format: { type: 'json_schema', schema } },
+    messages: [{ role: 'user', content }],
+  });
+  if (!res) return null;
 
   if (res.stop_reason !== 'end_turn') {
-    logger.warn('Claude 최종검수 판정 못 받음', { model, stop_reason: res.stop_reason, category: res.stop_details?.category });
+    logger.warn('Claude 판정 못 받음', { model, stop_reason: res.stop_reason, category: res.stop_details?.category });
     return UNDECIDED;
   }
   try {
     const o = JSON.parse(res.content.find((b) => b.type === 'text')?.text || '');
-    return {
-      [field]: o[field] === true,
-      confidence: Math.min(1, Math.max(0, Number(o.confidence) || 0)),
-      model,
-    };
+    return { ...o, confidence: Math.min(1, Math.max(0, Number(o.confidence) || 0)), model };
   } catch {
-    logger.warn('Claude 최종검수 JSON 파싱 실패', { model });
+    logger.warn('Claude JSON 파싱 실패', { model });
     return UNDECIDED;
   }
 }
 
+/** 1차 모델 → 판단을 못 하면 2차 모델. 둘 다 못 하면 1차의 애매한 판정, 그것도 없으면 null */
+async function review(api, content, schema) {
+  const first = await ask(api, config.CLAUDE_MODEL, content, schema);
+  if (first === null) return null; // API 오류
+  if (first !== UNDECIDED && first.confidence >= ESCALATE_BELOW) return first;
+
+  const second = await ask(api, config.CLAUDE_ESCALATION_MODEL, content, schema);
+  if (second && second !== UNDECIDED) return second;
+  return first === UNDECIDED ? null : first;
+}
+
 /**
  * @param {Buffer} buffer 이미지 버퍼 (scamImageScanner 가 디코드에 성공한 버퍼)
- * @returns {Promise<{scam:boolean,confidence:number,model:string}|null>} null → 로컬 VLM 사용
+ * @returns {Promise<{scam:boolean,confidence:number,model:string}|null>} null → AI 없이 진행
  */
 async function analyzeImage(buffer) {
   const api = getClient();
-  // 1차 모델이 쉬는 중이면 이미지 변환도 하지 않고 바로 로컬 VLM으로
-  if (!buffer || !api || Date.now() < (pausedUntil[config.CLAUDE_MODEL] || 0)) return null;
-
+  if (!buffer || !api) return null;
   const jpeg = await toJpeg(buffer);
   if (!jpeg) return null;
-
-  return review(api, imageContent(jpeg, PROMPT), 'scam');
+  return review(api, imageContent(jpeg, PROMPT), boolSchema('scam'));
 }
 
 /**
  * @param {Buffer} buffer 이미지 버퍼
  * @param {string} prompt 광고 판정 지시 + 함께 온 메시지 (adTextGuard 가 만든 것)
- * @returns {Promise<{ad:boolean,confidence:number,model:string}|null>} null → 로컬 LLM 사용
+ * @returns {Promise<{ad:boolean,confidence:number,model:string}|null>} null → 검사 건너뜀
  */
 async function analyzeAdImage(buffer, prompt) {
   const api = getClient();
-  if (!buffer || !api || Date.now() < (pausedUntil[config.CLAUDE_MODEL] || 0)) return null;
+  if (!buffer || !api) return null;
   const jpeg = await toJpeg(buffer);
   if (!jpeg) return null;
-  return review(api, imageContent(jpeg, prompt), 'ad');
-}
-
-function imageContent(jpeg, text) {
-  return [
-    { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: jpeg.toString('base64') } },
-    { type: 'text', text },
-  ];
+  return review(api, imageContent(jpeg, prompt), boolSchema('ad'));
 }
 
 /**
  * @param {string} prompt 판정 지시 + 메시지 원문 (adTextGuard 가 만든 것)
- * @returns {Promise<{ad:boolean,confidence:number,model:string}|null>} null → 로컬 LLM 사용
+ * @returns {Promise<{ad:boolean,confidence:number,model:string}|null>} null → 검사 건너뜀
  */
 async function analyzeText(prompt) {
   const api = getClient();
-  if (!prompt || !api || Date.now() < (pausedUntil[config.CLAUDE_MODEL] || 0)) return null;
-  return review(api, [{ type: 'text', text: prompt }], 'ad');
+  if (!prompt || !api) return null;
+  return review(api, [{ type: 'text', text: prompt }], boolSchema('ad'));
 }
 
-/** 1차 모델 → 판단을 못 하면 2차 모델. 둘 다 못 하면 1차의 애매한 판정, 그것도 없으면 null(로컬로) */
-async function review(api, content, field) {
-  const first = await ask(api, config.CLAUDE_MODEL, content, field);
-  if (first === null) return null; // API 오류 → 로컬
-  if (first !== UNDECIDED && first.confidence >= ESCALATE_BELOW) return first;
-
-  const second = await ask(api, config.CLAUDE_ESCALATION_MODEL, content, field);
-  if (second && second !== UNDECIDED) return second;
-  return first === UNDECIDED ? null : first;
+/**
+ * 디스코드 초대 대상 서버 판정 (이름·설명·아이콘).
+ * @returns {Promise<{adult:boolean,spam:boolean,confidence:number,reason:string,model:string}|null>} null → 키워드만
+ */
+async function analyzeDiscordServer({ name, description, iconBuffer } = {}) {
+  const api = getClient();
+  if (!api) return null;
+  const text = `${SERVER_PROMPT}\nSERVER NAME: ${(name || '(unknown)').slice(0, 200)}\n`
+    + `SERVER DESCRIPTION: ${(description || '(none)').slice(0, 1000)}`;
+  const jpeg = iconBuffer ? await toJpeg(iconBuffer) : null;
+  return review(api, jpeg ? imageContent(jpeg, text) : [{ type: 'text', text }], ADULT_SPAM_SCHEMA);
 }
 
-module.exports = { analyzeImage, analyzeText, analyzeAdImage };
+/**
+ * 디스코드 링크가 든 메시지의 문구 판정.
+ * @returns {Promise<{adult:boolean,spam:boolean,confidence:number,reason:string,model:string}|null>} null → 키워드만
+ */
+async function analyzeLinkMessage({ content } = {}) {
+  const api = getClient();
+  if (!api) return null;
+  const text = `${LINK_MESSAGE_PROMPT}\nMESSAGE: ${(content || '').slice(0, 1500)}`;
+  return review(api, [{ type: 'text', text }], ADULT_SPAM_SCHEMA);
+}
+
+/**
+ * 채팅 모더레이터 판정.
+ * @param {string} prompt 판정 지시 + 대화 (chatSafetyService 가 만든 것)
+ * @param {string[]} categories 허용 분류 (none 포함)
+ * @returns {Promise<{category:string,confidence:number,model:string}|null>} null → 판정 없음
+ */
+async function judgeChat(prompt, categories) {
+  const api = getClient();
+  if (!api) return null;
+  return review(api, [{ type: 'text', text: prompt }], {
+    type: 'object',
+    properties: { category: { type: 'string', enum: categories }, confidence: { type: 'number' } },
+    required: ['category', 'confidence'],
+    additionalProperties: false,
+  });
+}
+
+/**
+ * 채팅 모더레이터 로그 요약 (1차 모델만, 자유 텍스트).
+ * @returns {Promise<string|null>} null → 판정 없음
+ */
+async function summarizeChat(system, user) {
+  const api = getClient();
+  if (!api) return null;
+  const res = await call(api, config.CLAUDE_MODEL, {
+    max_tokens: 1024,
+    output_config: { effort: 'low' },
+    system,
+    messages: [{ role: 'user', content: user }],
+  });
+  if (!res || res.stop_reason !== 'end_turn') return null;
+  return res.content.filter((b) => b.type === 'text').map((b) => b.text).join('').trim() || null;
+}
+
+module.exports = {
+  analyzeImage, analyzeText, analyzeAdImage, analyzeDiscordServer, analyzeLinkMessage, judgeChat, summarizeChat,
+};

@@ -52,7 +52,7 @@ module.exports = (client) => {
     if (optoutStore.isOptedOut(message.author.id)) return;
 
     // ── 채팅 모더레이터 (실험 기능, experimentalGuilds.json 서버만) ──
-    // 최근 6줄 흐름을 로컬 LLM이 판정 → 유해하면 삭제 + 10분 타임아웃. 대기열로 따로 돌아서 아래 검사를 막지 않는다.
+    // 최근 6줄 흐름을 Claude 가 판정 → 유해하면 삭제 + 10분 타임아웃. 대기열로 따로 돌아서 아래 검사를 막지 않는다.
     chatModerator.observe(message);
 
     try {
@@ -152,7 +152,7 @@ module.exports = (client) => {
       }
 
       // ── 광고성 글 가드 (/adguard on 한 서버만) ──
-      // 다른 서버 디스코드 링크 → 바로 삭제. 링크·"프로필 확인"·DM/텔레그램 유도 문구가 있는 글·이미지(OCR·QR)는 AI(Claude → 로컬 LLM)에
+      // 다른 서버 디스코드 링크 → 바로 삭제. 링크·"프로필 확인"·DM/텔레그램 유도 문구가 있는 글·이미지(OCR·QR)는 AI(Claude)에
       // 광고인지 묻는다: 확신도 0.9 이상 → 삭제, 0.7 이상 → 아래 관리자 알림에 포함. (유도 문구가 없으면 비용 0으로 통과)
       // 해시 학습은 하지 않는다 — 학습은 전 서버 공통이라, 광고를 허용하는 서버에서 같은 글이 지워지면 안 된다.
       let adSuspicious = null;
